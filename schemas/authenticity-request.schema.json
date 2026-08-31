@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:link:release-control:release-set-authenticity:v1",
+  "title": "Link Release Set Authenticity Request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "kind",
+    "releaseId",
+    "releaseSetManifestSha256",
+    "combinedIdentitySha256"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "link.release-set-authenticity" },
+    "releaseId": { "const": "diagnostic-order-billing-final-lock-g-a" },
+    "releaseSetManifestSha256": {
+      "const": "7c9a35f00c3b23457f47736ddb3eaabe66195cd829e2ca360a922c14a05c509e"
+    },
+    "combinedIdentitySha256": {
+      "const": "891e8cad0ff697f62a7929e83dd4cd9db7a7f522ed0b3bb05a78f45e39d771d7"
+    }
+  }
+}

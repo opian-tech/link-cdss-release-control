@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "bootstrapComplete": false,
+  "defaultBranch": "main",
+  "maximumApprovalHours": 24,
+  "authenticity": {
+    "signingConfigured": false,
+    "expectedCertificateIdentity": "REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY",
+    "certificateOidcIssuer": "https://token.actions.githubusercontent.com"
+  },
+  "roleApprovers": {
+    "clinical-safety": [],
+    "operations": [],
+    "security": []
+  }
+}

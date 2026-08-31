@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:link:release-control:release-manifest:v1",
+  "title": "Link CDSS Release Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "releaseId",
+    "environment",
+    "sourceCommit",
+    "artifacts",
+    "sourceReviewEvidenceSha256",
+    "clinicalSafetyEvidenceSha256",
+    "promotionEvidenceSha256",
+    "releaseSetManifestSha256",
+    "combinedIdentitySha256",
+    "stagingManifestSha256",
+    "approvalIssue",
+    "createdAt",
+    "expiresAt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "releaseId": {
+      "type": "string",
+      "pattern": "^rel-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$"
+    },
+    "environment": { "enum": ["staging", "prod"] },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiSha256", "collectorSha256", "alertmanagerSha256"],
+      "properties": {
+        "apiSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "collectorSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "alertmanagerSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "promotionEvidenceSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sourceReviewEvidenceSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "clinicalSafetyEvidenceSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "releaseSetManifestSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "const": "7c9a35f00c3b23457f47736ddb3eaabe66195cd829e2ca360a922c14a05c509e"
+    },
+    "combinedIdentitySha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "const": "891e8cad0ff697f62a7929e83dd4cd9db7a7f522ed0b3bb05a78f45e39d771d7"
+    },
+    "stagingManifestSha256": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "approvalIssue": { "type": "integer", "minimum": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" }
+  }
+}
