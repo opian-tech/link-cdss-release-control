@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import base64
 import hashlib
 import importlib.util
 import json
@@ -23,6 +24,17 @@ SPEC.loader.exec_module(MODULE)
 SOURCE_ROOT = Path(
     os.environ.get("PUBLIC_REPOSITORY_UNDER_TEST", MODULE_PATH.parents[1])
 ).resolve()
+PUBLISHED_SOURCE_COMMIT = "16018f5842b4815e283d860b66d8614e0ce13e0a"
+PUBLISHED_PYTHON_PATHS = frozenset(
+    {
+        "scripts/test_verify_authenticity.py",
+        "scripts/test_verify_release.py",
+        "scripts/test_verify_repository_policy.py",
+        "scripts/verify_authenticity.py",
+        "scripts/verify_release.py",
+        "scripts/verify_repository_policy.py",
+    }
+)
 
 
 class PublicRepositoryPolicyTests(unittest.TestCase):
@@ -45,67 +57,265 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def mutate_signing_workflow(self, root: Path, old: str, new: str) -> None:
         self.mutate_named_workflow(root, "sign-authenticity-request.yml", old, new)
 
+    def load_trust_manifest(self, root: Path) -> dict[str, object]:
+        return json.loads((root / MODULE.TRUST_MANIFEST).read_text(encoding="utf-8"))
+
+    def write_trust_manifest(self, root: Path, document: dict[str, object]) -> None:
+        (root / MODULE.TRUST_MANIFEST).write_bytes(MODULE.canonical_json_bytes(document))
+
+    def stage_complete_bundle(self, root: Path, marker: bytes = b"# reviewed next bytes\n") -> None:
+        document = self.load_trust_manifest(root)
+        staged: dict[str, str] = {}
+        for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
+            source = root / relative
+            target = root / MODULE.STAGED_ROOT / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes() + marker)
+            target.chmod(0o644)
+            staged[relative] = hashlib.sha256(target.read_bytes()).hexdigest()
+        document["staged"] = staged
+        self.write_trust_manifest(root, document)
+
+    def promote_staged_bundle(self, root: Path) -> None:
+        document = self.load_trust_manifest(root)
+        staged = document["staged"]
+        self.assertIsInstance(staged, dict)
+        for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
+            (root / relative).write_bytes((root / MODULE.STAGED_ROOT / relative).read_bytes())
+        document["active"] = staged
+        self.write_trust_manifest(root, document)
+
+    def cleanup_staged_bundle(self, root: Path) -> None:
+        document = self.load_trust_manifest(root)
+        document.pop("staged")
+        shutil.rmtree(root / "trust")
+        self.write_trust_manifest(root, document)
+
     def test_current_scaffold_passes(self) -> None:
         result = MODULE.validate_repository(SOURCE_ROOT)
         self.assertGreater(result["files"], 8)
 
-    def test_current_workflows_match_exact_approved_byte_digests(self) -> None:
-        workflows = SOURCE_ROOT / ".github" / "workflows"
-        MODULE.validate_workflow_hash_allowlist(MODULE.WORKFLOW_SHA256_ALLOWLIST)
-        for name, expected in MODULE.WORKFLOW_SHA256_ALLOWLIST.items():
-            with self.subTest(name=name):
-                actual = hashlib.sha256((workflows / name).read_bytes()).hexdigest()
-                self.assertIn(actual, expected)
-                self.assertEqual(1, len(expected))
-
-    def test_three_pr_workflow_hash_rotation_is_permitted_by_trusted_base(self) -> None:
+    def test_published_workflow_and_legacy_positional_cli_remain_bootstrap_compatible(
+        self,
+    ) -> None:
         workflow = SOURCE_ROOT / ".github" / "workflows" / "validate-control.yml"
-        old_hash = hashlib.sha256(workflow.read_bytes()).hexdigest()
-        with tempfile.TemporaryDirectory() as directory:
-            future = Path(directory) / workflow.name
-            future.write_bytes(workflow.read_bytes().replace(
-                b"name: Validate public release control",
-                b"name: Validate public release control rotated",
-                1,
-            ))
-            future_hash = hashlib.sha256(future.read_bytes()).hexdigest()
-            base = dict(MODULE.WORKFLOW_SHA256_ALLOWLIST)
-
-            pr1 = {**base, workflow.name: frozenset({old_hash, future_hash})}
-            MODULE.validate_workflow_byte_contract(workflow, pr1)
-
-            MODULE.validate_workflow_byte_contract(future, pr1)
-
-            pr3 = {**base, workflow.name: frozenset({future_hash})}
-            MODULE.validate_workflow_byte_contract(future, pr3)
-            with self.assertRaisesRegex(MODULE.PolicyError, "not approved"):
-                MODULE.validate_workflow_byte_contract(workflow, pr3)
-
-    def test_workflow_hash_rotation_is_bounded_and_cannot_skip_pr1(self) -> None:
-        workflow = SOURCE_ROOT / ".github" / "workflows" / "validate-control.yml"
-        current_hash = hashlib.sha256(workflow.read_bytes()).hexdigest()
-        base = dict(MODULE.WORKFLOW_SHA256_ALLOWLIST)
-        invalid_sets = (
-            frozenset(),
-            frozenset({current_hash, "1" * 64, "2" * 64}),
-            frozenset({"NOT-A-DIGEST"}),
+        self.assertEqual(
+            "12c6efc77b7cec8964ea39c7ee845607027811ca8a9383892ffbb119a6d56638",
+            hashlib.sha256(workflow.read_bytes()).hexdigest(),
         )
-        for digests in invalid_sets:
-            with self.subTest(digests=digests):
-                invalid = {**base, workflow.name: digests}
-                with self.assertRaisesRegex(MODULE.PolicyError, "allowlist"):
-                    MODULE.validate_workflow_byte_contract(workflow, invalid)
+        self.assertEqual(
+            2,
+            workflow.read_text(encoding="utf-8").count(
+                'run: python3 scripts/verify_repository_policy.py "$CANDIDATE_ROOT"'
+            ),
+        )
 
-        future_only = {**base, workflow.name: frozenset({"f" * 64})}
-        with self.assertRaisesRegex(MODULE.PolicyError, "not approved"):
-            MODULE.validate_workflow_byte_contract(workflow, future_only)
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = self.copy_repository(directory)
+            relative = "scripts/verify_release.py"
+            trusted_file = candidate / relative
+            trusted_file.write_bytes(trusted_file.read_bytes() + b"# direct mutation\n")
+            document = self.load_trust_manifest(candidate)
+            document["active"][relative] = hashlib.sha256(
+                trusted_file.read_bytes()
+            ).hexdigest()
+            self.write_trust_manifest(candidate, document)
+            result = subprocess.run(
+                [sys.executable, str(MODULE_PATH), str(candidate)],
+                cwd=MODULE_PATH.parents[1],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, result.returncode)
+            self.assertIn("trusted-code transition", result.stderr)
+
+    def test_published_old_base_accepts_first_hardening_candidate(self) -> None:
+        self.assertFalse((SOURCE_ROOT / "trust").exists())
+        fixture_path = SOURCE_ROOT / "docs" / "published-python-controls.json"
+        raw = fixture_path.read_bytes()
+        fixture = json.loads(raw)
+        self.assertEqual(MODULE.canonical_json_bytes(fixture), raw)
+        self.assertEqual({"formatVersion", "sourceCommit", "files"}, set(fixture))
+        self.assertEqual(1, fixture["formatVersion"])
+        self.assertEqual(PUBLISHED_SOURCE_COMMIT, fixture["sourceCommit"])
+        self.assertEqual(PUBLISHED_PYTHON_PATHS, set(fixture["files"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            published_root = Path(directory) / "published-control"
+            for relative, record in fixture["files"].items():
+                self.assertEqual({"base64", "sha256"}, set(record))
+                content = base64.b64decode(record["base64"], validate=True)
+                self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
+                target = published_root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+                target.chmod(0o644)
+            (published_root / "schemas").mkdir()
+            for relative in ("README.md", "schemas/release-manifest.schema.json"):
+                target = published_root / relative
+                target.write_bytes((SOURCE_ROOT / relative).read_bytes())
+                target.chmod(0o644)
+
+            environment = {
+                **os.environ,
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PUBLIC_REPOSITORY_UNDER_TEST": str(SOURCE_ROOT),
+                "CANDIDATE_ROOT": str(SOURCE_ROOT),
+            }
+            commands = (
+                [sys.executable, "scripts/test_verify_release.py"],
+                [sys.executable, "scripts/test_verify_authenticity.py"],
+                [sys.executable, "scripts/test_verify_repository_policy.py"],
+                [
+                    sys.executable,
+                    "scripts/verify_repository_policy.py",
+                    str(SOURCE_ROOT),
+                ],
+            )
+            for command in commands:
+                with self.subTest(command=command):
+                    result = subprocess.run(
+                        command,
+                        cwd=published_root,
+                        env=environment,
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(
+                        0,
+                        result.returncode,
+                        result.stdout + result.stderr,
+                    )
+
+    def test_manifest_covers_all_workflows_verifiers_helpers_and_tests(self) -> None:
+        document = MODULE.validate_trust_state(SOURCE_ROOT)
+        self.assertEqual(MODULE.TRUSTED_CODE_PATHS, set(document["active"]))
+        self.assertEqual(10, len(document["active"]))
+        self.assertEqual(3, sum(path.startswith(".github/workflows/") for path in document["active"]))
+        self.assertEqual(6, sum(path.startswith("scripts/") for path in document["active"]))
+        self.assertIn("docs/published-python-controls.json", document["active"])
+
+    def test_valid_unchanged_stage_promote_and_cleanup_transitions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = self.copy_repository(str(Path(directory) / "base"))
+            unchanged = self.copy_repository(str(Path(directory) / "unchanged"))
+            self.assertEqual("unchanged", MODULE.validate_trusted_code_transition(base, unchanged))
+
+            staged = self.copy_repository(str(Path(directory) / "staged"))
+            self.stage_complete_bundle(staged)
+            self.assertEqual("stage", MODULE.validate_trusted_code_transition(base, staged))
+
+            promoted = Path(directory) / "promoted" / "release-control"
+            promoted.parent.mkdir()
+            shutil.copytree(staged, promoted)
+            self.promote_staged_bundle(promoted)
+            self.assertEqual("promote", MODULE.validate_trusted_code_transition(staged, promoted))
+            MODULE.validate_repository(promoted, staged)
+
+            cleaned = Path(directory) / "cleaned" / "release-control"
+            cleaned.parent.mkdir()
+            shutil.copytree(promoted, cleaned)
+            self.cleanup_staged_bundle(cleaned)
+            self.assertEqual("cleanup", MODULE.validate_trusted_code_transition(promoted, cleaned))
+
+    def test_direct_trusted_code_mutation_and_mapping_rewrite_fail(self) -> None:
+        for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as directory:
+                base = self.copy_repository(str(Path(directory) / "base"))
+                candidate = self.copy_repository(str(Path(directory) / "candidate"))
+                path = candidate / relative
+                path.write_bytes(path.read_bytes() + b"# direct mutation\n")
+                document = self.load_trust_manifest(candidate)
+                document["active"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.write_trust_manifest(candidate, document)
+                with self.assertRaisesRegex(MODULE.PolicyError, "trusted-code transition"):
+                    MODULE.validate_repository(candidate, base)
+
+    def test_active_trusted_code_rejects_executable_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            target = root / "scripts" / "verify_release.py"
+            target.chmod(0o755)
+            with self.assertRaisesRegex(MODULE.PolicyError, "executable trusted-code"):
+                MODULE.validate_trust_state(root)
+
+    def test_exact_promotion_rejects_executable_active_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            staged = self.copy_repository(str(Path(directory) / "staged"))
+            self.stage_complete_bundle(staged)
+            promoted = Path(directory) / "promoted" / "release-control"
+            promoted.parent.mkdir()
+            shutil.copytree(staged, promoted)
+            self.promote_staged_bundle(promoted)
+            (promoted / "scripts" / "verify_release.py").chmod(0o755)
+            with self.assertRaisesRegex(MODULE.PolicyError, "executable trusted-code"):
+                MODULE.validate_trusted_code_transition(staged, promoted)
+
+    def test_simultaneous_stage_and_promote_and_partial_promotion_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = self.copy_repository(str(Path(directory) / "base"))
+            simultaneous = self.copy_repository(str(Path(directory) / "simultaneous"))
+            self.stage_complete_bundle(simultaneous)
+            self.promote_staged_bundle(simultaneous)
+            with self.assertRaisesRegex(MODULE.PolicyError, "trusted-code transition"):
+                MODULE.validate_trusted_code_transition(base, simultaneous)
+
+            staged = self.copy_repository(str(Path(directory) / "staged"))
+            self.stage_complete_bundle(staged)
+            partial = Path(directory) / "partial" / "release-control"
+            partial.parent.mkdir()
+            shutil.copytree(staged, partial)
+            document = self.load_trust_manifest(partial)
+            first = sorted(MODULE.TRUSTED_CODE_PATHS)[0]
+            (partial / first).write_bytes((partial / MODULE.STAGED_ROOT / first).read_bytes())
+            document["active"][first] = document["staged"][first]
+            self.write_trust_manifest(partial, document)
+            with self.assertRaisesRegex(MODULE.PolicyError, "trusted-code transition"):
+                MODULE.validate_trusted_code_transition(staged, partial)
+
+    def test_malformed_unknown_traversal_and_incomplete_mappings_fail(self) -> None:
+        variants = (
+            lambda document: document.update({"unknown": True}),
+            lambda document: document["active"].update({"../escape.py": "a" * 64}),
+            lambda document: document["active"].update({"scripts/unknown.py": "a" * 64}),
+            lambda document: document["active"].update({next(iter(document["active"])): "bad"}),
+            lambda document: document["active"].pop(next(iter(document["active"]))),
+        )
+        for mutate in variants:
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                document = self.load_trust_manifest(root)
+                mutate(document)
+                self.write_trust_manifest(root, document)
+                with self.assertRaises(MODULE.PolicyError):
+                    MODULE.validate_trust_state(root)
+
+    def test_staged_tree_rejects_symlink_extra_and_executable_files(self) -> None:
+        for mutation in ("symlink", "extra", "executable"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.stage_complete_bundle(root)
+                target = root / MODULE.STAGED_ROOT / sorted(MODULE.TRUSTED_CODE_PATHS)[0]
+                if mutation == "symlink":
+                    target.unlink()
+                    target.symlink_to(root / sorted(MODULE.TRUSTED_CODE_PATHS)[0])
+                elif mutation == "extra":
+                    extra = root / MODULE.STAGED_ROOT / "scripts/extra.py"
+                    extra.write_text("raise SystemExit(1)\n", encoding="utf-8")
+                else:
+                    target.chmod(0o755)
+                with self.assertRaisesRegex(MODULE.PolicyError, "symlink|exactly|executable"):
+                    MODULE.validate_trust_state(root)
 
     def test_rotation_process_and_direct_main_prohibition_are_documented(self) -> None:
         readme = (SOURCE_ROOT / "README.md").read_text(encoding="utf-8")
         bootstrap = (SOURCE_ROOT / "docs" / "bootstrap.md").read_text(
             encoding="utf-8"
         )
-        for stage in ("**PR1:**", "**PR2:**", "**PR3:**"):
+        for stage in ("**Stage:**", "**Promote:**", "**Cleanup:**"):
             self.assertIn(stage, readme)
         self.assertIn("A direct-main change", readme)
         self.assertIn("disable direct pushes to `main`", bootstrap)
@@ -154,7 +364,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 self.mutate_named_workflow(root, name, old, new)
                 with self.assertRaisesRegex(
                     MODULE.PolicyError,
-                    "workflow byte digest|may execute only trusted verifier",
+                    "trusted-code byte digest|may execute only trusted verifier",
                 ):
                     MODULE.validate_repository(root)
 
@@ -298,13 +508,19 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def test_trusted_verifier_never_imports_or_executes_candidate_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             candidate = self.copy_repository(directory)
-            for path in (candidate / "scripts").glob("*.py"):
-                path.write_text(
-                    'raise RuntimeError("candidate code must remain inert")\n',
-                    encoding="utf-8",
-                )
+            self.stage_complete_bundle(
+                candidate,
+                b'raise RuntimeError("staged candidate code must remain inert")\n',
+            )
             result = subprocess.run(
-                [sys.executable, str(MODULE_PATH), str(candidate)],
+                [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "--trusted-root",
+                    str(MODULE_PATH.parents[1]),
+                    "--candidate-root",
+                    str(candidate),
+                ],
                 cwd=MODULE_PATH.parents[1],
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 check=False,

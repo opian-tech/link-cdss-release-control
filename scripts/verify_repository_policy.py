@@ -31,6 +31,7 @@ ALLOWED_DIRECTORIES = {
     "releases",
     "schemas",
     "scripts",
+    "trust",
 }
 ALLOWED_SUFFIXES = {".json", ".md", ".py", ".yml", ".yaml"}
 MAX_FILES = 128
@@ -41,19 +42,22 @@ EXPECTED_WORKFLOWS = {
     "sign-authenticity-request.yml",
     "validate-control.yml",
 }
-# These are bounded sets of exact reviewed workflow bytes. Keep one digest normally;
-# use two only during the documented three-PR protected-main rotation.
-WORKFLOW_SHA256_ALLOWLIST = {
-    "deploy-approved-release.yml": frozenset(
-        {"f5e251f383993c79f96a3fe7d80ddcdc8980c82ab85fd1c0bfcb0740afe4b304"}
-    ),
-    "sign-authenticity-request.yml": frozenset(
-        {"8dc11b00a53c757ff25910495e858b1822971f2b36e882aab62145c4cb2ce5b0"}
-    ),
-    "validate-control.yml": frozenset(
-        {"12c6efc77b7cec8964ea39c7ee845607027811ca8a9383892ffbb119a6d56638"}
-    ),
-}
+TRUSTED_CODE_PATHS = frozenset(
+    {
+        ".github/workflows/deploy-approved-release.yml",
+        ".github/workflows/sign-authenticity-request.yml",
+        ".github/workflows/validate-control.yml",
+        "docs/published-python-controls.json",
+        "scripts/test_verify_authenticity.py",
+        "scripts/test_verify_release.py",
+        "scripts/test_verify_repository_policy.py",
+        "scripts/verify_authenticity.py",
+        "scripts/verify_release.py",
+        "scripts/verify_repository_policy.py",
+    }
+)
+TRUST_MANIFEST = "docs/trusted-code-digests.json"
+STAGED_ROOT = Path("trust/next")
 ALLOWED_ENVIRONMENT_SECRETS = {
     "DEPLOY_HOST",
     "DEPLOY_USER",
@@ -240,28 +244,141 @@ def contains_sequence(block: list[str], expected: tuple[str, ...]) -> bool:
     )
 
 
-def validate_workflow_hash_allowlist(
-    allowlist: dict[str, frozenset[str]],
+def canonical_json_bytes(document: dict[str, object]) -> bytes:
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def validate_digest_mapping(value: object, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != TRUSTED_CODE_PATHS:
+        raise PolicyError(f"{label} trusted-code mapping must cover exactly all trusted paths")
+    mapping: dict[str, str] = {}
+    for path, digest in value.items():
+        if (
+            not isinstance(path, str)
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))
+        ):
+            raise PolicyError(f"{label} trusted-code mapping contains an unsafe path")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise PolicyError(f"{label} trusted-code mapping contains a malformed digest: {path}")
+        mapping[path] = digest
+    return mapping
+
+
+def load_trust_manifest(root: Path) -> dict[str, object]:
+    path = root / TRUST_MANIFEST
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PolicyError("trusted-code digest manifest must be valid UTF-8 JSON") from error
+    if not isinstance(document, dict) or not set(document) <= {"version", "active", "staged"}:
+        raise PolicyError("trusted-code digest manifest contains unknown fields")
+    if set(document) not in ({"version", "active"}, {"version", "active", "staged"}):
+        raise PolicyError("trusted-code digest manifest is incomplete")
+    if document.get("version") != 1:
+        raise PolicyError("trusted-code digest manifest version must be 1")
+    document["active"] = validate_digest_mapping(document.get("active"), "active")
+    if "staged" in document:
+        document["staged"] = validate_digest_mapping(document["staged"], "staged")
+    if raw != canonical_json_bytes(document):
+        raise PolicyError("trusted-code digest manifest must use canonical JSON encoding")
+    return document
+
+
+def validate_trusted_bytes(
+    root: Path, mapping: dict[str, str], prefix: Path = Path()
 ) -> None:
-    if set(allowlist) != EXPECTED_WORKFLOWS:
-        raise PolicyError("workflow digest allowlist does not match expected files")
-    for name, digests in allowlist.items():
-        if not isinstance(digests, frozenset) or not 1 <= len(digests) <= 2:
+    for relative, expected in mapping.items():
+        path = root / prefix / relative
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise PolicyError(f"trusted-code file is missing: {(prefix / relative).as_posix()}") from error
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise PolicyError(f"trusted-code file must be regular: {(prefix / relative).as_posix()}")
+        if metadata.st_mode & 0o111:
             raise PolicyError(
-                f"workflow digest allowlist must contain one or two hashes: {name}"
+                f"executable trusted-code file is prohibited: {(prefix / relative).as_posix()}"
             )
-        if any(re.fullmatch(r"[0-9a-f]{64}", digest) is None for digest in digests):
-            raise PolicyError(f"workflow digest allowlist is malformed: {name}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise PolicyError(f"trusted-code byte digest mismatch: {(prefix / relative).as_posix()}")
 
 
-def validate_workflow_byte_contract(
-    path: Path,
-    allowlist: dict[str, frozenset[str]] = WORKFLOW_SHA256_ALLOWLIST,
-) -> None:
-    validate_workflow_hash_allowlist(allowlist)
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual not in allowlist[path.name]:
-        raise PolicyError(f"workflow byte digest is not approved: {path.name}")
+def validate_staged_tree(root: Path, staged: dict[str, str] | None) -> None:
+    trust = root / "trust"
+    if staged is None:
+        if trust.exists() or trust.is_symlink():
+            raise PolicyError("trust tree is prohibited without a staged mapping")
+        return
+    expected = {STAGED_ROOT / path for path in TRUSTED_CODE_PATHS}
+    if not trust.is_dir() or trust.is_symlink():
+        raise PolicyError("complete staged trust/next tree is required")
+    actual: set[Path] = set()
+    for path in sorted(trust.rglob("*")):
+        relative = path.relative_to(root)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PolicyError(f"symlink is prohibited in staged trust tree: {relative}")
+        if path.is_dir():
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PolicyError(f"non-regular staged trust file is prohibited: {relative}")
+        if metadata.st_mode & 0o111:
+            raise PolicyError(f"executable staged trust file is prohibited: {relative}")
+        actual.add(relative)
+    if actual != expected:
+        raise PolicyError("staged trust tree must contain exactly the complete trusted-code bundle")
+    validate_trusted_bytes(root, staged, STAGED_ROOT)
+
+
+def validate_trust_state(root: Path) -> dict[str, object]:
+    document = load_trust_manifest(root)
+    active = document["active"]
+    assert isinstance(active, dict)
+    validate_trusted_bytes(root, active)
+    staged = document.get("staged")
+    assert staged is None or isinstance(staged, dict)
+    validate_staged_tree(root, staged)
+    return document
+
+
+def validate_trusted_code_transition(trusted_root: Path, candidate_root: Path) -> str:
+    base = validate_trust_state(trusted_root)
+    candidate = validate_trust_state(candidate_root)
+    base_active = base["active"]
+    candidate_active = candidate["active"]
+    base_staged = base.get("staged")
+    candidate_staged = candidate.get("staged")
+
+    if candidate == base:
+        return "unchanged"
+    if (
+        base_staged is None
+        and candidate_active == base_active
+        and candidate_staged is not None
+        and candidate_staged != base_active
+    ):
+        return "stage"
+    if (
+        base_staged is not None
+        and base_staged != base_active
+        and candidate_active == base_staged
+        and candidate_staged == base_staged
+    ):
+        return "promote"
+    if (
+        base_staged is not None
+        and base_active == base_staged
+        and candidate_active == base_active
+        and candidate_staged is None
+    ):
+        return "cleanup"
+    raise PolicyError(
+        "trusted-code transition must be unchanged, stage, exact promotion, or cleanup"
+    )
 
 
 def scalar_value(value: str) -> str:
@@ -596,11 +713,6 @@ def validate_workflows(root: Path) -> None:
     if secret_names != ALLOWED_ENVIRONMENT_SECRETS:
         raise PolicyError("deployment secret allowlist does not match policy")
 
-    # Exact bytes close parser and control-flow gaps left by the semantic checks above.
-    for path in sorted(workflows.iterdir()):
-        validate_workflow_byte_contract(path)
-
-
 def load_policy_document(root: Path) -> dict[str, object]:
     try:
         document = json.loads(
@@ -669,22 +781,32 @@ def validate_release_documents(root: Path, policy_document: dict[str, object]) -
         raise PolicyError(f"release manifest validation failed: {error}") from error
 
 
-def validate_repository(root: Path) -> dict[str, int]:
+def validate_repository(root: Path, trusted_root: Path | None = None) -> dict[str, int]:
+    trusted_root = root if trusted_root is None else trusted_root
     files = repository_files(root)
     scan_sensitive_content(root, files)
     validate_workflows(root)
     policy_document = load_policy_document(root)
     validate_authenticity_documents(root, policy_document)
     validate_release_documents(root, policy_document)
+    validate_trusted_code_transition(trusted_root, root)
     return {"files": len(files), "bytes": sum(path.stat().st_size for path in files)}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("repository", nargs="?", default=".")
+    parser.add_argument("repository", nargs="?")
+    parser.add_argument("--trusted-root")
+    parser.add_argument("--candidate-root")
     args = parser.parse_args()
+    if args.repository is not None and (
+        args.trusted_root is not None or args.candidate_root is not None
+    ):
+        parser.error("legacy positional repository cannot be combined with root flags")
     try:
-        result = validate_repository(Path(args.repository).resolve())
+        trusted_root = Path(args.trusted_root or ".").resolve()
+        candidate_root = Path(args.candidate_root or args.repository or ".").resolve()
+        result = validate_repository(candidate_root, trusted_root)
         print(f"public release-control policy passed: {result['files']} files, {result['bytes']} bytes")
         return 0
     except (OSError, PolicyError) as error:

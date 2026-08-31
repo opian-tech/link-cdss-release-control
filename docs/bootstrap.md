@@ -9,7 +9,8 @@
    pull requests. This initial trusted-base bootstrap is required because PR
    validation runs the workflow, tests, and policy verifier from the trusted
    base commit and treats the PR head only as inert candidate data. Confirm the
-   checked-in workflow SHA-256 contract before opening the repository to PRs.
+   checked-in `docs/trusted-code-digests.json` contract before opening the
+   repository to PRs.
 4. Assign the minimum required collaborators. Keep organization owner access
    narrowly held and independently reviewed.
 5. Replace `REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY` with the
@@ -31,18 +32,23 @@
 
 Require pull requests, two approvals, dismissal of stale approvals, approval of
 the most recent push by someone other than its author, conversation resolution,
-the `Validate public release control` status check, administrator enforcement,
+the `validate-pull-request` status check from `Validate public release control`,
+administrator enforcement,
 and linear history. Deny force pushes and deletion. Do not permit bypass actors.
 After the one-time initial bootstrap, disable direct pushes to `main` for users,
-administrators, and automation. Every later workflow or trusted-hash change must
+administrators, and automation. Every later workflow or trusted-code change must
 arrive through a pull request validated by verifier bytes from the base commit.
 The push check also uses the previous `main` verifier, but this is defense in
 depth and does not replace branch protection against staged direct pushes.
 
-Rotate workflow hashes with the three separate pull requests documented in the
-root README: add the reviewed future hash while workflow bytes stay unchanged;
-merge; update the workflow to those preapproved bytes; merge; remove the old
-hash. Keep one digest normally and no more than two during a transition.
+Rotate the complete ten-file trusted-code bundle with the three separate pull
+requests documented in the root README. Stage all three workflows, all six
+Python verifier/helper/test files, and `docs/published-python-controls.json` as
+non-executable bytes under `trust/next` with a complete staged mapping; merge;
+promote exactly that whole staged bundle while retaining it; merge; then remove
+only staged metadata and the staged tree. Never execute candidate or staged
+files, promote a subset, combine stage with promotion, or use a direct push for
+rotation.
 
 ## Environments
 

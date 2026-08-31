@@ -1,0 +1,15 @@
+{
+  "active": {
+    ".github/workflows/deploy-approved-release.yml": "f5e251f383993c79f96a3fe7d80ddcdc8980c82ab85fd1c0bfcb0740afe4b304",
+    ".github/workflows/sign-authenticity-request.yml": "8dc11b00a53c757ff25910495e858b1822971f2b36e882aab62145c4cb2ce5b0",
+    ".github/workflows/validate-control.yml": "12c6efc77b7cec8964ea39c7ee845607027811ca8a9383892ffbb119a6d56638",
+    "docs/published-python-controls.json": "138e13319e9d5033511b78374febc4a033a356af2048a72d8a20986088a2fbb9",
+    "scripts/test_verify_authenticity.py": "3ddf8ef4a444fad4c2af206f12a7dd17afaf28c63c7c4006f59ac989b66b9f1d",
+    "scripts/test_verify_release.py": "62fa35c6e109e3a4472266c299a8b3aa3870e1ac3d5f2e294968a42fe6e0bb25",
+    "scripts/test_verify_repository_policy.py": "b85ab2f1eed5d114a0f71ada5a6e882ef64583d47c806b8d8d1f9f0768e19b67",
+    "scripts/verify_authenticity.py": "38c296bd85d6500dea4d711f341fb088217482106d43e5422b06051cec9b331a",
+    "scripts/verify_release.py": "ef98812dd81194986adbe218307fbd04b23a9a0a8daab0e4696dd7b1dda09c26",
+    "scripts/verify_repository_policy.py": "14884070b35a7abf7a951924834338969e87d619c2f2fccb870377ac7792d977"
+  },
+  "version": 1
+}
