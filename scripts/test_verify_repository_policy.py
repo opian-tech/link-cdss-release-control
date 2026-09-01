@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 import base64
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,7 +27,8 @@ SPEC.loader.exec_module(MODULE)
 SOURCE_ROOT = Path(
     os.environ.get("PUBLIC_REPOSITORY_UNDER_TEST", MODULE_PATH.parents[1])
 ).resolve()
-PUBLISHED_SOURCE_COMMIT = "16018f5842b4815e283d860b66d8614e0ce13e0a"
+PUBLISHED_SOURCE_COMMIT = "6f499c4770770804ace579a1bafec8838949a613"
+PUBLISHED_ROOT_TREE = "a61a13379f8e4b04612160829526d73c7ed5e1ce"
 PUBLISHED_PYTHON_PATHS = frozenset(
     {
         "scripts/test_verify_authenticity.py",
@@ -41,6 +45,11 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def copy_repository(self, directory: str) -> Path:
         root = Path(directory) / "release-control"
         shutil.copytree(SOURCE_ROOT, root)
+        return root
+
+    def materialize_published_snapshot(self, directory: str) -> Path:
+        root = Path(directory) / "published-control"
+        MODULE.materialize_published_snapshot(SOURCE_ROOT, root)
         return root
 
     def mutate_workflow(self, root: Path, old: str, new: str) -> None:
@@ -63,6 +72,46 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def write_trust_manifest(self, root: Path, document: dict[str, object]) -> None:
         (root / MODULE.TRUST_MANIFEST).write_bytes(MODULE.canonical_json_bytes(document))
 
+    def load_fixture(self, root: Path) -> dict[str, object]:
+        return json.loads((root / MODULE.PUBLISHED_FIXTURE).read_text(encoding="utf-8"))
+
+    def write_fixture(self, root: Path, document: dict[str, object]) -> None:
+        (root / MODULE.PUBLISHED_FIXTURE).write_bytes(MODULE.canonical_json_bytes(document))
+
+    def set_fixture_archive(
+        self, fixture: dict[str, object], compressed: bytes, tar_size: int
+    ) -> None:
+        fixture["archive"] = {
+            "base64": base64.b64encode(compressed).decode("ascii"),
+            "compressedSha256": hashlib.sha256(compressed).hexdigest(),
+            "compressedSize": len(compressed),
+            "format": "canonical-tar-gzip-v1",
+            "tarSize": tar_size,
+        }
+
+    def custom_archive(
+        self, members: list[tuple[str, bytes, bytes, int]]
+    ) -> tuple[bytes, bytes]:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name, content, member_type, mode in members:
+                member = tarfile.TarInfo(name)
+                member.type = member_type
+                member.mode = mode
+                member.mtime = 0
+                member.uid = member.gid = 0
+                member.size = len(content) if member_type == tarfile.REGTYPE else 0
+                if member_type == tarfile.SYMTYPE:
+                    member.linkname = "README.md"
+                archive.addfile(member, io.BytesIO(content) if member.isreg() else None)
+        tar_bytes = buffer.getvalue()
+        compressed_buffer = io.BytesIO()
+        with gzip.GzipFile(
+            filename="", mode="wb", compresslevel=9, fileobj=compressed_buffer, mtime=0
+        ) as gzip_file:
+            gzip_file.write(tar_bytes)
+        return compressed_buffer.getvalue(), tar_bytes
+
     def stage_complete_bundle(self, root: Path, marker: bytes = b"# reviewed next bytes\n") -> None:
         document = self.load_trust_manifest(root)
         staged: dict[str, str] = {}
@@ -70,7 +119,10 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             source = root / relative
             target = root / MODULE.STAGED_ROOT / relative
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(source.read_bytes() + marker)
+            content = source.read_bytes()
+            if relative != MODULE.PUBLISHED_FIXTURE:
+                content += marker
+            target.write_bytes(content)
             target.chmod(0o644)
             staged[relative] = hashlib.sha256(target.read_bytes()).hexdigest()
         document["staged"] = staged
@@ -83,6 +135,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
             (root / relative).write_bytes((root / MODULE.STAGED_ROOT / relative).read_bytes())
         document["active"] = staged
+        document.pop("bootstrapRecovery", None)
         self.write_trust_manifest(root, document)
 
     def cleanup_staged_bundle(self, root: Path) -> None:
@@ -92,7 +145,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         self.write_trust_manifest(root, document)
 
     def test_current_scaffold_passes(self) -> None:
-        result = MODULE.validate_repository(SOURCE_ROOT)
+        result = MODULE.validate_self_check(SOURCE_ROOT)
         self.assertGreater(result["files"], 8)
 
     def test_published_workflow_and_legacy_positional_cli_remain_bootstrap_compatible(
@@ -137,26 +190,28 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         raw = fixture_path.read_bytes()
         fixture = json.loads(raw)
         self.assertEqual(MODULE.canonical_json_bytes(fixture), raw)
-        self.assertEqual({"formatVersion", "sourceCommit", "files"}, set(fixture))
-        self.assertEqual(1, fixture["formatVersion"])
-        self.assertEqual(PUBLISHED_SOURCE_COMMIT, fixture["sourceCommit"])
-        self.assertEqual(PUBLISHED_PYTHON_PATHS, set(fixture["files"]))
+        self.assertEqual({"archive", "formatVersion", "sourceCommit", "files"}, set(fixture))
+        self.assertEqual(3, fixture["formatVersion"])
+        self.assertEqual(PUBLISHED_SOURCE_COMMIT, fixture["sourceCommit"]["objectId"])
+        self.assertEqual(PUBLISHED_ROOT_TREE, fixture["sourceCommit"]["rootTree"])
+        commit_bytes = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        commit_text = MODULE.validate_published_commit_headers(commit_bytes)
+        self.assertIn(
+            f"author {MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY} ", commit_text
+        )
+        self.assertIn(
+            f"committer {MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY} ", commit_text
+        )
+        self.assertNotIn("noreply.github.com", commit_text.lower())
+        self.assertEqual(19, len(fixture["files"]))
+        MODULE.load_published_fixture(SOURCE_ROOT)
+        archive_contents = MODULE.load_published_archive(fixture)
+        self.assertEqual(MODULE.PUBLISHED_SNAPSHOT_PATHS, set(archive_contents))
+        self.assertEqual(PUBLISHED_PYTHON_PATHS, {p for p in archive_contents if p.endswith(".py")})
 
         with tempfile.TemporaryDirectory() as directory:
             published_root = Path(directory) / "published-control"
-            for relative, record in fixture["files"].items():
-                self.assertEqual({"base64", "sha256"}, set(record))
-                content = base64.b64decode(record["base64"], validate=True)
-                self.assertEqual(record["sha256"], hashlib.sha256(content).hexdigest())
-                target = published_root / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(content)
-                target.chmod(0o644)
-            (published_root / "schemas").mkdir()
-            for relative in ("README.md", "schemas/release-manifest.schema.json"):
-                target = published_root / relative
-                target.write_bytes((SOURCE_ROOT / relative).read_bytes())
-                target.chmod(0o644)
+            MODULE.materialize_published_snapshot(SOURCE_ROOT, published_root)
 
             environment = {
                 **os.environ,
@@ -192,11 +247,188 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
 
     def test_manifest_covers_all_workflows_verifiers_helpers_and_tests(self) -> None:
         document = MODULE.validate_trust_state(SOURCE_ROOT)
+        self.assertEqual(2, document["version"])
+        self.assertEqual(
+            {
+                "sourceCommit": PUBLISHED_SOURCE_COMMIT,
+                "rootTree": PUBLISHED_ROOT_TREE,
+            },
+            document["bootstrapRecovery"],
+        )
         self.assertEqual(MODULE.TRUSTED_CODE_PATHS, set(document["active"]))
         self.assertEqual(10, len(document["active"]))
         self.assertEqual(3, sum(path.startswith(".github/workflows/") for path in document["active"]))
         self.assertEqual(6, sum(path.startswith("scripts/") for path in document["active"]))
         self.assertIn("docs/published-python-controls.json", document["active"])
+
+    def test_clean_runner_self_check_has_no_external_fixture_dependency(self) -> None:
+        verifier_source = MODULE_PATH.read_text(encoding="utf-8")
+        for prohibited in ("import subprocess", "import socket", "import urllib"):
+            self.assertNotIn(prohibited, verifier_source)
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "HOME": str(Path(directory) / "absent-home"),
+                "PATH": "",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "TMPDIR": str(Path(directory) / "absent-temp"),
+            }
+            result = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "--self-check", str(SOURCE_ROOT)],
+                cwd=SOURCE_ROOT,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def test_fixture_rejects_schema_base64_digest_blob_commit_tree_and_bounds_drift(self) -> None:
+        mutations = {
+            "unknown field": lambda value: value.update({"unknown": True}),
+            "missing path": lambda value: value["files"].pop(next(iter(value["files"]))),
+            "unknown path": lambda value: value["files"].update(
+                {"scripts/unknown.py": next(iter(value["files"].values()))}
+            ),
+            "malformed base64": lambda value: value["archive"].update({"base64": "%%%"}),
+            "oversize": lambda value: value["archive"].update(
+                {
+                    "base64": "A"
+                    * (((MODULE.MAX_PUBLISHED_ARCHIVE_COMPRESSED_BYTES + 2) // 3) * 4 + 4)
+                }
+            ),
+            "archive sha drift": lambda value: value["archive"].update(
+                {"compressedSha256": "0" * 64}
+            ),
+            "blob drift": lambda value: value["files"][next(iter(value["files"]))].update(
+                {"gitBlobSha1": "0" * 40}
+            ),
+            "commit drift": lambda value: value["sourceCommit"].update(
+                {"rawBase64": base64.b64encode(b"tree " + b"0" * 40 + b"\n").decode()}
+            ),
+            "tree drift": lambda value: value["sourceCommit"].update(
+                {"rootTree": "0" * 40}
+            ),
+            "mode drift": lambda value: value["files"][next(iter(value["files"]))].update(
+                {"mode": "100755"}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                fixture = self.load_fixture(root)
+                mutate(fixture)
+                self.write_fixture(root, fixture)
+                with self.assertRaises(MODULE.PolicyError):
+                    MODULE.load_published_fixture(root)
+
+    def test_fixture_rejects_malformed_noncanonical_and_oversized_archives(self) -> None:
+        valid_contents = MODULE.load_published_archive(self.load_fixture(SOURCE_ROOT))
+        regular_members = [
+            (path, content, tarfile.REGTYPE, 0o644)
+            for path, content in sorted(valid_contents.items())
+        ]
+        variants: dict[str, tuple[bytes, int]] = {}
+        for label, members in (
+            ("traversal", [("../escape", b"x", tarfile.REGTYPE, 0o644)]),
+            ("symlink", [("README.md", b"", tarfile.SYMTYPE, 0o644)]),
+            ("nonregular", [("README.md", b"", tarfile.DIRTYPE, 0o755)]),
+            ("extra", regular_members + [("extra.md", b"x", tarfile.REGTYPE, 0o644)]),
+            ("missing", regular_members[1:]),
+            (
+                "mode",
+                [(regular_members[0][0], regular_members[0][1], tarfile.REGTYPE, 0o755)]
+                + regular_members[1:],
+            ),
+            (
+                "member oversize",
+                [("README.md", b"x" * (MODULE.MAX_FILE_BYTES + 1), tarfile.REGTYPE, 0o644)],
+            ),
+        ):
+            compressed, tar_bytes = self.custom_archive(members)
+            variants[label] = (compressed, len(tar_bytes))
+        variants["malformed gzip"] = (b"not-gzip", 1)
+        bomb = gzip.compress(b"x" * (MODULE.MAX_PUBLISHED_ARCHIVE_BYTES + 1), mtime=0)
+        variants["decompressed oversize"] = (bomb, MODULE.MAX_PUBLISHED_ARCHIVE_BYTES + 1)
+        valid_compressed, valid_tar = MODULE.canonical_published_archive(valid_contents)
+        noncanonical_buffer = io.BytesIO()
+        with gzip.GzipFile(filename="", mode="wb", fileobj=noncanonical_buffer, mtime=1) as stream:
+            stream.write(valid_tar)
+        variants["nondeterministic gzip"] = (noncanonical_buffer.getvalue(), len(valid_tar))
+
+        for label, (compressed, tar_size) in variants.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                fixture = self.load_fixture(root)
+                self.set_fixture_archive(fixture, compressed, tar_size)
+                self.write_fixture(root, fixture)
+                with self.assertRaises(MODULE.PolicyError):
+                    MODULE.load_published_fixture(root)
+
+    def test_fixture_scans_every_decoded_member_before_identity_rejection(self) -> None:
+        payloads = (
+            b'password = "SYNTHETIC-' + b'CREDENTIAL-123"\n',
+            b'credential = "github_' + b'pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ"\n',
+            b'key = "-----BEGIN ' + b'PRIVATE KEY-----"\n',
+            b'host = "192.' + b'168.4.20"\n',
+            b'patientId = "SYNTHETIC-123"\n',
+            b'MRN: "TEST-9988"\n',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                fixture = self.load_fixture(root)
+                contents = MODULE.load_published_archive(fixture)
+                contents["README.md"] = payload
+                compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                self.set_fixture_archive(fixture, compressed, len(tar_bytes))
+                self.write_fixture(root, fixture)
+                with self.assertRaisesRegex(MODULE.PolicyError, "possible"):
+                    MODULE.load_published_fixture(root)
+
+    def test_fixture_scans_decoded_raw_commit_headers_for_identity_disclosures(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        valid_commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        variants = (
+            (
+                "personal login",
+                valid_commit.replace(
+                    MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
+                    b"personal-login <release-control@link.invalid>",
+                ),
+                "approved neutral project identity",
+            ),
+            (
+                "GitHub noreply email",
+                valid_commit.replace(
+                    MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
+                    b"Link Release Control "
+                    b"<123456+personal-login@users.noreply.github.com>",
+                ),
+                "personal GitHub noreply identity",
+            ),
+            (
+                "prohibited identity data",
+                valid_commit.replace(
+                    MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
+                    b"Link Release Control <github_"
+                    + b"pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ>",
+                ),
+                "access token",
+            ),
+        )
+        for label, commit_bytes, message in variants:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                mutated = self.load_fixture(root)
+                object_id = MODULE.git_object_id("commit", commit_bytes)
+                mutated["sourceCommit"]["rawBase64"] = base64.b64encode(
+                    commit_bytes
+                ).decode("ascii")
+                mutated["sourceCommit"]["objectId"] = object_id
+                self.write_fixture(root, mutated)
+                with mock.patch.object(MODULE, "PUBLISHED_SOURCE_COMMIT", object_id):
+                    with self.assertRaisesRegex(MODULE.PolicyError, message):
+                        MODULE.load_published_fixture(root)
 
     def test_valid_unchanged_stage_promote_and_cleanup_transitions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -213,13 +445,135 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             shutil.copytree(staged, promoted)
             self.promote_staged_bundle(promoted)
             self.assertEqual("promote", MODULE.validate_trusted_code_transition(staged, promoted))
-            MODULE.validate_repository(promoted, staged)
+            MODULE.validate_transition(staged, promoted)
 
             cleaned = Path(directory) / "cleaned" / "release-control"
             cleaned.parent.mkdir()
             shutil.copytree(promoted, cleaned)
             self.cleanup_staged_bundle(cleaned)
             self.assertEqual("cleanup", MODULE.validate_trusted_code_transition(promoted, cleaned))
+
+    def test_exact_bootstrap_recovery_before_and_after_stage_passes(self) -> None:
+        for staged_base in (False, True):
+            with self.subTest(staged_base=staged_base), tempfile.TemporaryDirectory() as directory:
+                base = self.copy_repository(str(Path(directory) / "base"))
+                if staged_base:
+                    self.stage_complete_bundle(base)
+                recovery = self.materialize_published_snapshot(str(Path(directory) / "candidate"))
+                self.assertEqual(
+                    "bootstrap-recovery",
+                    MODULE.validate_trusted_code_transition(base, recovery),
+                )
+                result = MODULE.validate_transition(base, recovery)
+                self.assertEqual(19, result["files"])
+
+    def test_exact_recovery_ends_lineage_and_rehardening_starts_a_new_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            hardened = self.copy_repository(str(Path(directory) / "hardened"))
+            recovered = self.materialize_published_snapshot(str(Path(directory) / "recovered"))
+            self.assertEqual(
+                "bootstrap-recovery",
+                MODULE.validate_trusted_code_transition(hardened, recovered),
+            )
+            self.assertFalse((recovered / MODULE.TRUST_MANIFEST).exists())
+
+            new_hardening = self.copy_repository(str(Path(directory) / "new-hardening"))
+            result = subprocess.run(
+                [sys.executable, "scripts/verify_repository_policy.py", str(new_hardening)],
+                cwd=recovered,
+                env={
+                    **os.environ,
+                    "CANDIDATE_ROOT": str(new_hardening),
+                    "PUBLIC_REPOSITORY_UNDER_TEST": str(new_hardening),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertIn("bootstrapRecovery", self.load_trust_manifest(new_hardening))
+
+    def test_bootstrap_recovery_rejects_missing_extra_changed_symlink_and_mode_drift(self) -> None:
+        mutations = ("missing", "extra", "changed", "symlink", "mode")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                base = self.copy_repository(str(Path(directory) / "base"))
+                recovery = self.materialize_published_snapshot(str(Path(directory) / "candidate"))
+                target = recovery / "README.md"
+                if mutation == "missing":
+                    target.unlink()
+                elif mutation == "extra":
+                    (recovery / "extra.md").write_text("extra\n", encoding="utf-8")
+                elif mutation == "changed":
+                    target.write_bytes(target.read_bytes() + b"changed\n")
+                elif mutation == "symlink":
+                    target.unlink()
+                    target.symlink_to(recovery / "SECURITY.md")
+                else:
+                    target.chmod(0o755)
+                with self.assertRaises(MODULE.PolicyError):
+                    MODULE.validate_trusted_code_transition(base, recovery)
+
+    def test_promotion_consumes_recovery_within_the_hardened_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            staged = self.copy_repository(str(Path(directory) / "staged"))
+            self.stage_complete_bundle(staged)
+            promoted = self.copy_repository(str(Path(directory) / "promoted"))
+            self.stage_complete_bundle(promoted)
+            self.promote_staged_bundle(promoted)
+            self.assertNotIn("bootstrapRecovery", self.load_trust_manifest(promoted))
+            self.assertEqual("promote", MODULE.validate_trusted_code_transition(staged, promoted))
+
+            cleaned = self.copy_repository(str(Path(directory) / "cleaned"))
+            self.stage_complete_bundle(cleaned)
+            self.promote_staged_bundle(cleaned)
+            self.cleanup_staged_bundle(cleaned)
+            self.assertEqual("cleanup", MODULE.validate_trusted_code_transition(promoted, cleaned))
+
+            recovery = self.materialize_published_snapshot(str(Path(directory) / "recovery"))
+            with self.assertRaisesRegex(MODULE.PolicyError, "not authorized"):
+                MODULE.validate_trusted_code_transition(cleaned, recovery)
+
+            restored = Path(directory) / "restored" / "release-control"
+            restored.parent.mkdir()
+            shutil.copytree(cleaned, restored)
+            document = self.load_trust_manifest(restored)
+            document["bootstrapRecovery"] = {
+                "sourceCommit": PUBLISHED_SOURCE_COMMIT,
+                "rootTree": PUBLISHED_ROOT_TREE,
+            }
+            self.write_trust_manifest(restored, document)
+            with self.assertRaisesRegex(MODULE.PolicyError, "cannot be restored"):
+                MODULE.validate_trusted_code_transition(cleaned, restored)
+
+    def test_cli_self_check_and_distinct_transition_modes(self) -> None:
+        commands = (
+            (["--self-check", str(SOURCE_ROOT)], 0),
+            (
+                [
+                    "--trusted-root",
+                    str(SOURCE_ROOT),
+                    "--candidate-root",
+                    str(SOURCE_ROOT),
+                ],
+                1,
+            ),
+            (["--trusted-root", str(SOURCE_ROOT)], 2),
+            (["--candidate-root", str(SOURCE_ROOT)], 2),
+            ([str(SOURCE_ROOT)], 1),
+        )
+        for arguments, expected in commands:
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [sys.executable, str(MODULE_PATH), *arguments],
+                    cwd=SOURCE_ROOT,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(expected, result.returncode, result.stdout + result.stderr)
 
     def test_direct_trusted_code_mutation_and_mapping_rewrite_fail(self) -> None:
         for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
@@ -231,8 +585,10 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 document = self.load_trust_manifest(candidate)
                 document["active"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
                 self.write_trust_manifest(candidate, document)
-                with self.assertRaisesRegex(MODULE.PolicyError, "trusted-code transition"):
-                    MODULE.validate_repository(candidate, base)
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError, "trusted-code transition|published snapshot"
+                ):
+                    MODULE.validate_transition(base, candidate)
 
     def test_active_trusted_code_rejects_executable_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -319,6 +675,14 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             self.assertIn(stage, readme)
         self.assertIn("A direct-main change", readme)
         self.assertIn("disable direct pushes to `main`", bootstrap)
+        self.assertIn("`required_status_checks.strict: true`", bootstrap)
+        self.assertIn("sole required check context", bootstrap)
+        self.assertIn("exactly `validate-pull-request`", bootstrap)
+        self.assertIn("app binding is GitHub Actions", bootstrap)
+        self.assertIn("lineage-scoped authorization", readme)
+        self.assertIn("not a globally one-time", readme)
+        self.assertIn("new bootstrap", bootstrap)
+        self.assertIn("two approvals", bootstrap)
         validation = (
             SOURCE_ROOT / ".github" / "workflows" / "validate-control.yml"
         ).read_text(encoding="utf-8")
@@ -366,7 +730,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                     MODULE.PolicyError,
                     "trusted-code byte digest|may execute only trusted verifier",
                 ):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_application_source_and_unknown_root_file_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -375,24 +739,24 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             source.mkdir()
             (source / "Patient.cs").write_text("public class Patient {}")
             with self.assertRaisesRegex(MODULE.PolicyError, "not allowlisted"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
             shutil.rmtree(source)
             (root / "notes.txt").write_text("internal")
             with self.assertRaisesRegex(MODULE.PolicyError, "not allowlisted"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_symlink_and_oversized_file_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             (root / "docs" / "linked.md").symlink_to(root / "README.md")
             with self.assertRaisesRegex(MODULE.PolicyError, "symlink"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
             (root / "docs" / "linked.md").unlink()
             (root / "docs" / "large.md").write_text(
                 "x" * (MODULE.MAX_FILE_BYTES + 1)
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "size"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_secret_private_key_and_private_address_fail(self) -> None:
         payloads = (
@@ -405,14 +769,14 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 (root / "docs" / "leak.md").write_text(payload)
                 with self.assertRaisesRegex(MODULE.PolicyError, "possible"):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_sensitive_filename_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             (root / "docs" / "credentials.json").write_text("{}")
             with self.assertRaisesRegex(MODULE.PolicyError, "filename"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_unpinned_action_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -423,7 +787,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "actions/checkout@v4",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "full lowercase"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_local_docker_unknown_and_extra_actions_fail(self) -> None:
         mutations = (
@@ -452,7 +816,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.PolicyError, "uses|action.*allowlist"
                 ):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_broad_and_unexpected_job_permissions_fail(self) -> None:
         mutations = (
@@ -480,7 +844,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_workflow(root, old, new)
                 with self.assertRaisesRegex(MODULE.PolicyError, "permissions"):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_pr_validation_uses_only_trusted_base_code_against_inert_candidate(self) -> None:
         validation = (
@@ -561,7 +925,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_named_workflow(root, "validate-control.yml", old, new)
                 with self.assertRaises(MODULE.PolicyError):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_authenticity_request_is_required_exact_and_canonical(self) -> None:
         variants = (
@@ -578,12 +942,12 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 (root / "authenticity" / "authenticity-request.json").write_bytes(raw)
                 with self.assertRaisesRegex(MODULE.PolicyError, "authenticity validation"):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             (root / "authenticity" / "authenticity-request.json").unlink()
             with self.assertRaisesRegex(MODULE.PolicyError, "allowlist"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_orphan_or_unconfigured_bundle_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -594,14 +958,14 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             )
             (authenticity / "authenticity-request.json").unlink()
             with self.assertRaisesRegex(MODULE.PolicyError, "allowlist"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             (root / "authenticity" / "authenticity-request.sigstore.json").write_text(
                 '{"mediaType":"test"}', encoding="utf-8"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "not configured"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_signing_workflow_privilege_upload_and_identity_weakening_fail(self) -> None:
         mutations = (
@@ -619,7 +983,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_signing_workflow(root, old, new)
                 with self.assertRaises(MODULE.PolicyError):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_signing_workflow_requires_fail_closed_identity_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -630,7 +994,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "true",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_unsafe_trigger_and_public_self_hosted_runner_fail(self) -> None:
         mutations = (
@@ -642,7 +1006,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_workflow(root, old, new)
                 with self.assertRaisesRegex(MODULE.PolicyError, "unsafe"):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_dynamic_environment_and_gate_secret_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -651,7 +1015,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root, "environment:\n      name: staging", "environment: ${{ inputs.environment }}"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control|static"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(
@@ -660,7 +1024,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "GH_TOKEN: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "gate"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_runtime_host_enrollment_and_unknown_secret_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -671,7 +1035,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "ssh-keyscan \"$DEPLOY_HOST\" > \"$known_hosts\"",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "unsafe"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(
@@ -680,7 +1044,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "DEPLOY_HOST: ${{ secrets.UNSCOPED_TOKEN }}",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "allowlist"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_missing_static_environment_and_token_permission_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -689,12 +1053,12 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root, "environment:\n      name: prod", "environment:\n      name: production"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(root, "permissions: {}", "permissions:\n      contents: write")
             with self.assertRaisesRegex(MODULE.PolicyError, "permissions"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_deploy_authenticity_gate_cannot_be_commented_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -713,7 +1077,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "          # --cosign cosign",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "actively verify"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_deploy_manifest_report_authenticity_mismatch_controls_cannot_be_reused(self) -> None:
         mutations = (
@@ -738,7 +1102,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                     MODULE.PolicyError,
                     "authenticity request|authenticity bindings|byte digest",
                 ):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
     def test_manifest_is_rejected_before_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -747,7 +1111,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "{}", encoding="utf-8"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "before bootstrap"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_completed_bootstrap_without_bundle_fails_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -765,7 +1129,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             }
             policy_path.write_text(json.dumps(policy), encoding="utf-8")
             with self.assertRaisesRegex(MODULE.PolicyError, "requires a committed"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
 
     def test_configured_signing_before_bootstrap_allows_missing_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -781,7 +1145,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "certificateOidcIssuer": MODULE.verify_authenticity.EXPECTED_ISSUER,
             }
             policy_path.write_text(json.dumps(policy), encoding="utf-8")
-            MODULE.validate_repository(root)
+            MODULE.validate_self_check(root)
 
     def test_configured_repository_validates_every_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -837,12 +1201,12 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             path = root / "releases" / f"{release_id}.json"
             path.write_text(json.dumps(manifest))
             with mock.patch.object(MODULE.verify_authenticity, "verify_bundle"):
-                MODULE.validate_repository(root)
+                MODULE.validate_self_check(root)
             manifest["unexpected"] = True
             path.write_text(json.dumps(manifest))
             with mock.patch.object(MODULE.verify_authenticity, "verify_bundle"):
                 with self.assertRaisesRegex(MODULE.PolicyError, "manifest validation"):
-                    MODULE.validate_repository(root)
+                    MODULE.validate_self_check(root)
 
 
 if __name__ == "__main__":

@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import gzip
 import hashlib
+import io
 import json
 import re
 import stat
 import sys
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +42,41 @@ ALLOWED_SUFFIXES = {".json", ".md", ".py", ".yml", ".yaml"}
 MAX_FILES = 128
 MAX_FILE_BYTES = 256 * 1024
 MAX_TOTAL_BYTES = 2 * 1024 * 1024
+MAX_COMMIT_BYTES = 64 * 1024
+MAX_PUBLISHED_ARCHIVE_COMPRESSED_BYTES = 192 * 1024
+MAX_PUBLISHED_ARCHIVE_BYTES = 512 * 1024
+PUBLISHED_FIXTURE = "docs/published-python-controls.json"
+PUBLISHED_SOURCE_COMMIT = "6f499c4770770804ace579a1bafec8838949a613"
+PUBLISHED_ROOT_TREE = "a61a13379f8e4b04612160829526d73c7ed5e1ce"
+APPROVED_PUBLISHED_COMMIT_IDENTITY = (
+    "Link Release Control <release-control@link.invalid>"
+)
+PUBLISHED_SNAPSHOT_PATHS = frozenset(
+    {
+        ".github/workflows/deploy-approved-release.yml",
+        ".github/workflows/sign-authenticity-request.yml",
+        ".github/workflows/validate-control.yml",
+        ".gitignore",
+        "README.md",
+        "SECURITY.md",
+        "authenticity/README.md",
+        "authenticity/authenticity-request.json",
+        "docs/bootstrap.md",
+        "release-control-policy.json",
+        "releases/README.md",
+        "schemas/authenticity-request.schema.json",
+        "schemas/release-manifest.schema.json",
+        "scripts/test_verify_authenticity.py",
+        "scripts/test_verify_release.py",
+        "scripts/test_verify_repository_policy.py",
+        "scripts/verify_authenticity.py",
+        "scripts/verify_release.py",
+        "scripts/verify_repository_policy.py",
+    }
+)
+PUBLISHED_PYTHON_PATHS = frozenset(
+    path for path in PUBLISHED_SNAPSHOT_PATHS if path.startswith("scripts/")
+)
 EXPECTED_WORKFLOWS = {
     "deploy-approved-release.yml",
     "sign-authenticity-request.yml",
@@ -173,6 +213,76 @@ def scan_sensitive_content(root: Path, files: list[Path]) -> None:
                 raise PolicyError(f"possible {label} found in {relative}")
 
 
+def scan_sensitive_bytes(relative: str, content: bytes) -> None:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeError as error:
+        raise PolicyError(f"published archive member is not UTF-8: {relative}") from error
+    patterns = (
+        ("private key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+        ("access token", re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{12,}")),
+        ("cloud access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+        (
+            "credential assignment",
+            re.compile(
+                r"(?im)\b(?:password|client_secret|api_?key|access_?token)"
+                r"\s*[:=]\s*[\"'][^\"'\r\n]{8,128}[\"']"
+            ),
+        ),
+        (
+            "private network address",
+            re.compile(
+                r"(?<![0-9.])(?:10\.(?:\d{1,3}\.){2}\d{1,3}|"
+                r"192\.168\.(?:\d{1,3}\.)\d{1,3}|"
+                r"172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})(?![0-9.])"
+            ),
+        ),
+        (
+            "synthetic PHI marker",
+            re.compile(
+                r"(?im)\b(?:mrn|patient_?id|patientId)\s*[:=]\s*[\"']"
+                r"[A-Za-z0-9][A-Za-z0-9-]{2,63}[\"']"
+            ),
+        ),
+        (
+            "personal GitHub noreply identity",
+            re.compile(
+                r"\b(?:\d+\+)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+                r"@users\.noreply\.github\.com\b",
+                re.IGNORECASE,
+            ),
+        ),
+    )
+    for label, pattern in patterns:
+        if pattern.search(text):
+            raise PolicyError(f"possible {label} found in published archive member: {relative}")
+
+
+def validate_published_commit_headers(commit_bytes: bytes) -> str:
+    scan_sensitive_bytes("source commit", commit_bytes)
+    try:
+        commit_text = commit_bytes.decode("utf-8")
+    except UnicodeError as error:
+        raise PolicyError("published source commit is not UTF-8") from error
+    headers, separator, _ = commit_text.partition("\n\n")
+    if not separator:
+        raise PolicyError("published source commit has no message separator")
+    header_lines = headers.splitlines()
+    for kind in ("author", "committer"):
+        matching = [line for line in header_lines if line.startswith(f"{kind} ")]
+        if len(matching) != 1:
+            raise PolicyError(f"published source commit must have exactly one {kind} header")
+        expected = re.compile(
+            rf"{kind} {re.escape(APPROVED_PUBLISHED_COMMIT_IDENTITY)} "
+            r"\d+ [+-]\d{4}"
+        )
+        if expected.fullmatch(matching[0]) is None:
+            raise PolicyError(
+                f"published source commit {kind} must use the approved neutral project identity"
+            )
+    return commit_text
+
+
 def strip_yaml_comment(line: str) -> str:
     quote: str | None = None
     escaped = False
@@ -248,6 +358,242 @@ def canonical_json_bytes(document: dict[str, object]) -> bytes:
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def git_object_id(kind: str, content: bytes) -> str:
+    return hashlib.sha1(
+        kind.encode("ascii") + b" " + str(len(content)).encode("ascii") + b"\0" + content
+    ).hexdigest()
+
+
+def validate_snapshot_path(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or value.startswith("/")
+        or "\\" in value
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise PolicyError("published snapshot contains an unsafe path")
+    return value
+
+
+def decode_fixture_base64(value: object, label: str, maximum: int) -> bytes:
+    if not isinstance(value, str) or len(value) > ((maximum + 2) // 3) * 4:
+        raise PolicyError(f"{label} exceeds its encoded size bound")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error) as error:
+        raise PolicyError(f"{label} must be strict base64") from error
+    if len(decoded) > maximum or base64.b64encode(decoded).decode("ascii") != value:
+        raise PolicyError(f"{label} must use canonical bounded base64")
+    return decoded
+
+
+def reconstruct_tree_id(files: dict[str, dict[str, str]]) -> str:
+    nodes: dict[str, object] = {}
+    for relative, record in files.items():
+        current = nodes
+        parts = relative.split("/")
+        for part in parts[:-1]:
+            child = current.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise PolicyError("published snapshot has a file/directory collision")
+            current = child
+        if parts[-1] in current:
+            raise PolicyError("published snapshot contains a duplicate path")
+        current[parts[-1]] = record["gitBlobSha1"]
+
+    def hash_tree(tree: dict[str, object]) -> str:
+        entries: list[tuple[bytes, bytes]] = []
+        for name, value in tree.items():
+            encoded_name = name.encode("utf-8")
+            if isinstance(value, dict):
+                mode = b"40000"
+                object_id = hash_tree(value)
+            else:
+                mode = b"100644"
+                object_id = value
+            entries.append((encoded_name, mode + b" " + encoded_name + b"\0" + bytes.fromhex(object_id)))
+        entries.sort(key=lambda entry: entry[0] + (b"/" if isinstance(tree[entry[0].decode("utf-8")], dict) else b""))
+        return git_object_id("tree", b"".join(entry for _, entry in entries))
+
+    return hash_tree(nodes)
+
+
+def canonical_published_archive(contents: dict[str, bytes]) -> tuple[bytes, bytes]:
+    tar_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for relative in sorted(contents):
+            content = contents[relative]
+            member = tarfile.TarInfo(relative)
+            member.size = len(content)
+            member.mode = 0o644
+            member.mtime = 0
+            member.uid = 0
+            member.gid = 0
+            member.uname = ""
+            member.gname = ""
+            archive.addfile(member, io.BytesIO(content))
+    tar_bytes = tar_buffer.getvalue()
+    gzip_buffer = io.BytesIO()
+    with gzip.GzipFile(
+        filename="", mode="wb", compresslevel=9, fileobj=gzip_buffer, mtime=0
+    ) as compressed:
+        compressed.write(tar_bytes)
+    return gzip_buffer.getvalue(), tar_bytes
+
+
+def load_published_archive(document: dict[str, object]) -> dict[str, bytes]:
+    archive_record = document.get("archive")
+    if not isinstance(archive_record, dict) or set(archive_record) != {
+        "base64",
+        "compressedSha256",
+        "compressedSize",
+        "format",
+        "tarSize",
+    }:
+        raise PolicyError("published archive must use the exact schema")
+    if archive_record.get("format") != "canonical-tar-gzip-v1":
+        raise PolicyError("published archive format is unsupported")
+    compressed = decode_fixture_base64(
+        archive_record.get("base64"),
+        "published compressed archive",
+        MAX_PUBLISHED_ARCHIVE_COMPRESSED_BYTES,
+    )
+    if type(archive_record.get("compressedSize")) is not int or archive_record[
+        "compressedSize"
+    ] != len(compressed):
+        raise PolicyError("published compressed archive size mismatch")
+    if not isinstance(archive_record.get("compressedSha256"), str) or hashlib.sha256(
+        compressed
+    ).hexdigest() != archive_record["compressedSha256"]:
+        raise PolicyError("published compressed archive SHA-256 mismatch")
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as gzip_file:
+            tar_bytes = gzip_file.read(MAX_PUBLISHED_ARCHIVE_BYTES + 1)
+    except (EOFError, OSError) as error:
+        raise PolicyError("published compressed archive is malformed") from error
+    if len(tar_bytes) > MAX_PUBLISHED_ARCHIVE_BYTES:
+        raise PolicyError("published archive exceeds its decompressed size bound")
+    if type(archive_record.get("tarSize")) is not int or archive_record["tarSize"] != len(
+        tar_bytes
+    ):
+        raise PolicyError("published archive decompressed size mismatch")
+
+    contents: dict[str, bytes] = {}
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
+            members = archive.getmembers()
+            for member in members:
+                relative = validate_snapshot_path(member.name)
+                if not member.isreg():
+                    raise PolicyError(
+                        f"published archive member must be a regular file: {relative}"
+                    )
+                if member.mode != 0o644:
+                    raise PolicyError(f"published archive member mode mismatch: {relative}")
+                if member.size > MAX_FILE_BYTES:
+                    raise PolicyError(f"published archive member exceeds size bound: {relative}")
+                if relative in contents:
+                    raise PolicyError(f"published archive contains a duplicate path: {relative}")
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise PolicyError(f"published archive member cannot be read: {relative}")
+                content = extracted.read(MAX_FILE_BYTES + 1)
+                if len(content) != member.size:
+                    raise PolicyError(f"published archive member size mismatch: {relative}")
+                contents[relative] = content
+    except (tarfile.TarError, UnicodeError) as error:
+        raise PolicyError("published tar archive is malformed") from error
+    if set(contents) != PUBLISHED_SNAPSHOT_PATHS:
+        raise PolicyError("published archive must contain exactly all 19 snapshot files")
+    canonical_compressed, canonical_tar = canonical_published_archive(contents)
+    if tar_bytes != canonical_tar or compressed != canonical_compressed:
+        raise PolicyError("published archive must use deterministic canonical bytes")
+    return contents
+
+
+def load_published_fixture(root: Path) -> dict[str, object]:
+    path = root / PUBLISHED_FIXTURE
+    try:
+        raw = path.read_bytes()
+        document = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PolicyError("published snapshot fixture must be valid UTF-8 JSON") from error
+    if not isinstance(document, dict) or set(document) != {
+        "archive",
+        "formatVersion",
+        "sourceCommit",
+        "files",
+    }:
+        raise PolicyError("published snapshot fixture must use the exact v3 schema")
+    if document.get("formatVersion") != 3:
+        raise PolicyError("published snapshot fixture formatVersion must be 3")
+
+    source = document.get("sourceCommit")
+    if not isinstance(source, dict) or set(source) != {"objectId", "rawBase64", "rootTree"}:
+        raise PolicyError("published source commit must use the exact schema")
+    commit_bytes = decode_fixture_base64(source.get("rawBase64"), "published commit", MAX_COMMIT_BYTES)
+    commit_text = validate_published_commit_headers(commit_bytes)
+    if source.get("objectId") != PUBLISHED_SOURCE_COMMIT:
+        raise PolicyError("published source commit ID is unexpected")
+    if git_object_id("commit", commit_bytes) != source["objectId"]:
+        raise PolicyError("published source commit bytes do not reconstruct its ID")
+    tree_lines = [line for line in commit_text.splitlines() if line.startswith("tree ")]
+    if tree_lines != [f"tree {source.get('rootTree')}"]:
+        raise PolicyError("published source commit has an invalid root tree binding")
+    if source.get("rootTree") != PUBLISHED_ROOT_TREE:
+        raise PolicyError("published root tree ID is unexpected")
+
+    file_value = document.get("files")
+    if not isinstance(file_value, dict) or set(file_value) != PUBLISHED_SNAPSHOT_PATHS:
+        raise PolicyError("published snapshot must contain exactly all 19 published paths")
+    files: dict[str, dict[str, str]] = {}
+    for raw_relative, raw_record in file_value.items():
+        relative = validate_snapshot_path(raw_relative)
+        if not isinstance(raw_record, dict) or set(raw_record) != {
+            "gitBlobSha1",
+            "mode",
+            "sha256",
+        }:
+            raise PolicyError(f"published snapshot record has unknown fields: {relative}")
+        if raw_record.get("mode") != "100644":
+            raise PolicyError(f"published snapshot mode must be 100644: {relative}")
+        if not isinstance(raw_record.get("gitBlobSha1"), str) or re.fullmatch(
+            r"[0-9a-f]{40}", raw_record["gitBlobSha1"]
+        ) is None:
+            raise PolicyError(f"published snapshot blob ID is malformed: {relative}")
+        if not isinstance(raw_record.get("sha256"), str) or re.fullmatch(
+            r"[0-9a-f]{64}", raw_record["sha256"]
+        ) is None:
+            raise PolicyError(f"published snapshot SHA-256 is malformed: {relative}")
+        files[relative] = raw_record
+    contents = load_published_archive(document)
+    for relative, content in contents.items():
+        scan_sensitive_bytes(relative, content)
+        snapshot = files[relative]
+        if git_object_id("blob", content) != snapshot["gitBlobSha1"]:
+            raise PolicyError(f"published archive blob ID mismatch: {relative}")
+        if hashlib.sha256(content).hexdigest() != snapshot["sha256"]:
+            raise PolicyError(f"published archive SHA-256 mismatch: {relative}")
+    if reconstruct_tree_id(files) != source["rootTree"]:
+        raise PolicyError("published snapshot does not reconstruct the bound root tree")
+    if raw != canonical_json_bytes(document):
+        raise PolicyError("published snapshot fixture must use canonical JSON encoding")
+    return document
+
+
+def materialize_published_snapshot(fixture_root: Path, destination: Path) -> None:
+    document = load_published_fixture(fixture_root)
+    contents = load_published_archive(document)
+    if destination.exists() or destination.is_symlink():
+        raise PolicyError("published snapshot destination must not already exist")
+    destination.mkdir(parents=True, mode=0o755)
+    for relative, content in contents.items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o644)
+
+
 def validate_digest_mapping(value: object, label: str) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != TRUSTED_CODE_PATHS:
         raise PolicyError(f"{label} trusted-code mapping must cover exactly all trusted paths")
@@ -273,15 +619,26 @@ def load_trust_manifest(root: Path) -> dict[str, object]:
         document = json.loads(raw)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PolicyError("trusted-code digest manifest must be valid UTF-8 JSON") from error
-    if not isinstance(document, dict) or not set(document) <= {"version", "active", "staged"}:
+    if not isinstance(document, dict) or not set(document) <= {
+        "version",
+        "active",
+        "staged",
+        "bootstrapRecovery",
+    }:
         raise PolicyError("trusted-code digest manifest contains unknown fields")
-    if set(document) not in ({"version", "active"}, {"version", "active", "staged"}):
+    required = {"version", "active"}
+    if not required <= set(document):
         raise PolicyError("trusted-code digest manifest is incomplete")
-    if document.get("version") != 1:
-        raise PolicyError("trusted-code digest manifest version must be 1")
+    if document.get("version") != 2:
+        raise PolicyError("trusted-code digest manifest version must be 2")
     document["active"] = validate_digest_mapping(document.get("active"), "active")
     if "staged" in document:
         document["staged"] = validate_digest_mapping(document["staged"], "staged")
+    if "bootstrapRecovery" in document and document["bootstrapRecovery"] != {
+        "sourceCommit": PUBLISHED_SOURCE_COMMIT,
+        "rootTree": PUBLISHED_ROOT_TREE,
+    }:
+        raise PolicyError("bootstrap recovery authorization is malformed")
     if raw != canonical_json_bytes(document):
         raise PolicyError("trusted-code digest manifest must use canonical JSON encoding")
     return document
@@ -335,6 +692,7 @@ def validate_staged_tree(root: Path, staged: dict[str, str] | None) -> None:
 
 
 def validate_trust_state(root: Path) -> dict[str, object]:
+    load_published_fixture(root)
     document = load_trust_manifest(root)
     active = document["active"]
     assert isinstance(active, dict)
@@ -345,14 +703,63 @@ def validate_trust_state(root: Path) -> dict[str, object]:
     return document
 
 
+def validate_published_recovery(root: Path, fixture: dict[str, object]) -> None:
+    file_records = fixture["files"]
+    assert isinstance(file_records, dict)
+    expected_contents = load_published_archive(fixture)
+    actual: dict[str, Path] = {}
+    if root.is_symlink() or not root.is_dir():
+        raise PolicyError("recovery root must be a non-symlink directory")
+    for path in sorted(root.rglob("*")):
+        relative_path = path.relative_to(root)
+        if ".git" in relative_path.parts:
+            continue
+        metadata = path.lstat()
+        relative = relative_path.as_posix()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise PolicyError(f"published recovery contains a symlink: {relative}")
+        if path.is_dir():
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PolicyError(f"published recovery contains a non-regular file: {relative}")
+        actual[relative] = path
+    if set(actual) != PUBLISHED_SNAPSHOT_PATHS:
+        raise PolicyError("published recovery must contain exactly all 19 snapshot files")
+    files = list(actual.values())
+    scan_sensitive_content(root, files)
+    for relative, path in actual.items():
+        metadata = path.lstat()
+        if stat.S_IMODE(metadata.st_mode) != 0o644:
+            raise PolicyError(f"published recovery mode mismatch: {relative}")
+        content = path.read_bytes()
+        record = file_records[relative]
+        assert isinstance(record, dict)
+        if content != expected_contents[relative]:
+            raise PolicyError(f"published recovery byte mismatch: {relative}")
+        if git_object_id("blob", content) != record["gitBlobSha1"]:
+            raise PolicyError(f"published recovery blob ID mismatch: {relative}")
+        if hashlib.sha256(content).hexdigest() != record["sha256"]:
+            raise PolicyError(f"published recovery SHA-256 mismatch: {relative}")
+
+
 def validate_trusted_code_transition(trusted_root: Path, candidate_root: Path) -> str:
     base = validate_trust_state(trusted_root)
+    authorization = base.get("bootstrapRecovery")
+    candidate_manifest = candidate_root / TRUST_MANIFEST
+    if not candidate_manifest.exists() and not candidate_manifest.is_symlink():
+        if authorization is None:
+            raise PolicyError("published recovery is not authorized")
+        validate_published_recovery(candidate_root, load_published_fixture(trusted_root))
+        return "bootstrap-recovery"
     candidate = validate_trust_state(candidate_root)
     base_active = base["active"]
     candidate_active = candidate["active"]
     base_staged = base.get("staged")
     candidate_staged = candidate.get("staged")
 
+    candidate_authorization = candidate.get("bootstrapRecovery")
+    if authorization is None and candidate_authorization is not None:
+        raise PolicyError("bootstrap recovery authorization cannot be restored")
     if candidate == base:
         return "unchanged"
     if (
@@ -360,6 +767,7 @@ def validate_trusted_code_transition(trusted_root: Path, candidate_root: Path) -
         and candidate_active == base_active
         and candidate_staged is not None
         and candidate_staged != base_active
+        and candidate_authorization == authorization
     ):
         return "stage"
     if (
@@ -367,6 +775,17 @@ def validate_trusted_code_transition(trusted_root: Path, candidate_root: Path) -
         and base_staged != base_active
         and candidate_active == base_staged
         and candidate_staged == base_staged
+        and authorization is not None
+        and candidate_authorization is None
+    ):
+        return "promote"
+    if (
+        base_staged is not None
+        and base_staged != base_active
+        and candidate_active == base_staged
+        and candidate_staged == base_staged
+        and authorization is None
+        and candidate_authorization is None
     ):
         return "promote"
     if (
@@ -374,6 +793,7 @@ def validate_trusted_code_transition(trusted_root: Path, candidate_root: Path) -
         and base_active == base_staged
         and candidate_active == base_active
         and candidate_staged is None
+        and candidate_authorization == authorization
     ):
         return "cleanup"
     raise PolicyError(
@@ -781,16 +1201,34 @@ def validate_release_documents(root: Path, policy_document: dict[str, object]) -
         raise PolicyError(f"release manifest validation failed: {error}") from error
 
 
-def validate_repository(root: Path, trusted_root: Path | None = None) -> dict[str, int]:
-    trusted_root = root if trusted_root is None else trusted_root
+def validate_candidate_content(root: Path) -> dict[str, int]:
     files = repository_files(root)
     scan_sensitive_content(root, files)
     validate_workflows(root)
     policy_document = load_policy_document(root)
     validate_authenticity_documents(root, policy_document)
     validate_release_documents(root, policy_document)
-    validate_trusted_code_transition(trusted_root, root)
     return {"files": len(files), "bytes": sum(path.stat().st_size for path in files)}
+
+
+def validate_self_check(root: Path) -> dict[str, int]:
+    result = validate_candidate_content(root)
+    validate_trust_state(root)
+    return result
+
+
+def validate_transition(trusted_root: Path, candidate_root: Path) -> dict[str, int]:
+    if trusted_root.resolve() == candidate_root.resolve():
+        raise PolicyError("transition roots must resolve to distinct directories")
+    transition = validate_trusted_code_transition(trusted_root, candidate_root)
+    if transition == "bootstrap-recovery":
+        files = [
+            path
+            for path in candidate_root.rglob("*")
+            if path.is_file() and ".git" not in path.relative_to(candidate_root).parts
+        ]
+        return {"files": len(files), "bytes": sum(path.stat().st_size for path in files)}
+    return validate_candidate_content(candidate_root)
 
 
 def main() -> int:
@@ -798,15 +1236,25 @@ def main() -> int:
     parser.add_argument("repository", nargs="?")
     parser.add_argument("--trusted-root")
     parser.add_argument("--candidate-root")
+    parser.add_argument("--self-check")
     args = parser.parse_args()
-    if args.repository is not None and (
-        args.trusted_root is not None or args.candidate_root is not None
-    ):
-        parser.error("legacy positional repository cannot be combined with root flags")
+    if args.self_check is not None:
+        if args.repository is not None or args.trusted_root is not None or args.candidate_root is not None:
+            parser.error("--self-check cannot be combined with transition arguments")
+    elif args.repository is not None:
+        if args.trusted_root is not None or args.candidate_root is not None:
+            parser.error("legacy positional candidate cannot be combined with root flags")
+    elif (args.trusted_root is None) != (args.candidate_root is None):
+        parser.error("--trusted-root and --candidate-root must be supplied together")
+    elif args.trusted_root is None:
+        parser.error("choose --self-check ROOT or a trusted/candidate transition")
     try:
-        trusted_root = Path(args.trusted_root or ".").resolve()
-        candidate_root = Path(args.candidate_root or args.repository or ".").resolve()
-        result = validate_repository(candidate_root, trusted_root)
+        if args.self_check is not None:
+            result = validate_self_check(Path(args.self_check).resolve())
+        else:
+            trusted_root = Path(args.trusted_root or ".").resolve()
+            candidate_root = Path(args.candidate_root or args.repository).resolve()
+            result = validate_transition(trusted_root, candidate_root)
         print(f"public release-control policy passed: {result['files']} files, {result['bytes']} bytes")
         return 0
     except (OSError, PolicyError) as error:

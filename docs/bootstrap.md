@@ -32,7 +32,9 @@
 
 Require pull requests, two approvals, dismissal of stale approvals, approval of
 the most recent push by someone other than its author, conversation resolution,
-the `validate-pull-request` status check from `Validate public release control`,
+`required_status_checks.strict: true`, and exactly the
+`validate-pull-request` status check bound to the GitHub Actions app from
+`Validate public release control`,
 administrator enforcement,
 and linear history. Deny force pushes and deletion. Do not permit bypass actors.
 After the one-time initial bootstrap, disable direct pushes to `main` for users,
@@ -49,6 +51,15 @@ promote exactly that whole staged bundle while retaining it; merge; then remove
 only staged metadata and the staged tree. Never execute candidate or staged
 files, promote a subset, combine stage with promotion, or use a direct push for
 rotation.
+
+The initial hardened trust manifest may carry `bootstrapRecovery`. Treat it as
+lineage-scoped authorization for exact recovery to the committed known-base
+snapshot, not as globally persistent one-time state. Promotion consumes it and
+it cannot be re-added by cleanup or a later transition in that hardened
+lineage. Exact recovery returns to the fail-closed manifest-less published
+state. Reapplying the hardening from that state is a new bootstrap: repeat the
+full protected pull-request process with two approvals and all required checks,
+then establish a new hardened lineage and its new recovery authorization.
 
 ## Environments
 
@@ -88,6 +99,10 @@ Before every production cutover, independently export and review branch
 protection, environment reviewer and bypass settings, environment secret names,
 workflow SHA pins, role mappings, and denied bypass tests. Repository owners can
 change hosted settings, so checked-in policy alone is not sufficient evidence.
+Audit the branch-protection API response and retain evidence that
+`required_status_checks.strict` is `true`, that the sole required check context
+is exactly `validate-pull-request`, and that its app binding is GitHub Actions;
+a matching unbound context or a check produced by another app is insufficient.
 Include the authenticity workflow identity, OIDC issuer, workflow permissions,
 Cosign version, canonical request digest bindings, and bundle verification in
 that independent review.

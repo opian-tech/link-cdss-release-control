@@ -127,5 +127,30 @@ python3 scripts/verify_release.py --help
 python3 scripts/test_verify_release.py
 python3 scripts/test_verify_authenticity.py
 python3 scripts/test_verify_repository_policy.py
-python3 scripts/verify_repository_policy.py --trusted-root . --candidate-root .
+python3 scripts/verify_repository_policy.py --self-check .
 ```
+
+Transition validation always compares distinct immutable trees. From a trusted
+base checkout, the workflow-compatible positional form is
+`python3 scripts/verify_repository_policy.py /path/to/candidate`; automation may
+instead pass both `--trusted-root /path/to/base` and
+`--candidate-root /path/to/candidate`. Supplying the same resolved root is an
+error and `--self-check` never authorizes a transition.
+
+The v3 published snapshot fixture is self-contained. It binds the raw bootstrap
+commit object, its root tree, all 19 published file modes and Git/SHA-256 blob
+identities, and a deterministic compressed archive containing the exact 19
+files. Validation and materialization use only Python's standard library and
+the committed fixture; they do not require Git, an external repository,
+network access, or a machine-local bootstrap copy.
+
+`bootstrapRecovery` is a lineage-scoped authorization, not a globally one-time
+state. While present in the initial hardened lineage, including after staging,
+it permits recovery only to the exact known fail-closed published snapshot.
+The first promotion consumes it, and cleanup or later transitions in that
+hardened lineage cannot restore it. Exact recovery deliberately leaves the
+hardened lineage and returns to the manifest-less published trust state.
+Reapplying hardening after recovery is a new bootstrap, requires the complete
+protected two-approval process, and establishes a new lineage with a new
+`bootstrapRecovery` authorization. No repository-only control can persist a
+global consumption marker across that intentional return to the old state.
