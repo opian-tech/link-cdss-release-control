@@ -33,8 +33,7 @@ class PublicReleaseVerifierTests(unittest.TestCase):
                 "authenticity": {
                     "signingConfigured": True,
                     "expectedCertificateIdentity": (
-                        "https://github.com/example/release-control/.github/workflows/"
-                        "sign-authenticity-request.yml@refs/heads/main"
+                        MODULE.verify_authenticity.EXPECTED_CERTIFICATE_IDENTITY
                     ),
                     "certificateOidcIssuer": "https://token.actions.githubusercontent.com",
                 },

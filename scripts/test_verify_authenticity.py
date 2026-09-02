@@ -26,10 +26,7 @@ class AuthenticityVerifierTests(unittest.TestCase):
     def setUp(self) -> None:
         self.configured_policy = {
             "signingConfigured": True,
-            "expectedCertificateIdentity": (
-                "https://github.com/example/release-control/.github/workflows/"
-                "sign-authenticity-request.yml@refs/heads/main"
-            ),
+            "expectedCertificateIdentity": MODULE.EXPECTED_CERTIFICATE_IDENTITY,
             "certificateOidcIssuer": "https://token.actions.githubusercontent.com",
         }
 
@@ -41,6 +38,27 @@ class AuthenticityVerifierTests(unittest.TestCase):
     def test_checked_in_request_is_exact_and_canonical(self) -> None:
         request = SOURCE_ROOT / "authenticity" / "authenticity-request.json"
         self.assertEqual(MODULE.EXPECTED_REQUEST, MODULE.validate_request(request))
+
+    def test_checked_in_policy_retains_unconfigured_placeholder_for_hardening(self) -> None:
+        policy_path = SOURCE_ROOT / "release-control-policy.json"
+        document = json.loads(policy_path.read_text(encoding="utf-8"))
+        self.assertFalse(document["bootstrapComplete"])
+        self.assertEqual(
+            {
+                "clinical-safety": [],
+                "operations": [],
+                "security": [],
+            },
+            document["roleApprovers"],
+        )
+        self.assertEqual(
+            {
+                "signingConfigured": False,
+                "expectedCertificateIdentity": MODULE.IDENTITY_PLACEHOLDER,
+                "certificateOidcIssuer": MODULE.EXPECTED_ISSUER,
+            },
+            MODULE.validate_authenticity_policy(document["authenticity"]),
+        )
 
     def test_malformed_noncanonical_extra_and_wrong_values_fail(self) -> None:
         variants = (
@@ -86,6 +104,7 @@ class AuthenticityVerifierTests(unittest.TestCase):
 
     def test_identity_must_be_exact_main_workflow_url(self) -> None:
         invalid = (
+            "https://github.com/foreign-owner/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main",
             "https://github.com/example/*/.github/workflows/sign-authenticity-request.yml@refs/heads/main",
             "https://github.com/example/release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/*",
             "https://github.com/example/release-control/.github/workflows/other.yml@refs/heads/main",
