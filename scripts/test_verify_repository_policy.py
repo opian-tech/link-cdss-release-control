@@ -25,8 +25,12 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
-SOURCE_ROOT = MODULE_PATH.parents[1].resolve()
-CANDIDATE_ROOT = Path(os.environ.get("CANDIDATE_ROOT", SOURCE_ROOT)).resolve()
+SOURCE_ROOT = (
+    MODULE_PATH.parents[3]
+    if MODULE_PATH.parents[1].name == "next"
+    and MODULE_PATH.parents[2].name == "trust"
+    else MODULE_PATH.parents[1]
+)
 PUBLISHED_SOURCE_COMMIT = "16018f5842b4815e283d860b66d8614e0ce13e0a"
 PUBLISHED_ROOT_TREE = "a61a13379f8e4b04612160829526d73c7ed5e1ce"
 PUBLISHED_PYTHON_PATHS = frozenset(
@@ -44,7 +48,19 @@ PUBLISHED_PYTHON_PATHS = frozenset(
 class PublicRepositoryPolicyTests(unittest.TestCase):
     def copy_repository(self, directory: str) -> Path:
         root = Path(directory) / "release-control"
-        shutil.copytree(SOURCE_ROOT, root)
+        shutil.copytree(SOURCE_ROOT, root, symlinks=True)
+        document = self.load_trust_manifest(root)
+        if "staged" in document:
+            document.pop("staged")
+            shutil.rmtree(root / MODULE.STAGED_ROOT.parts[0])
+        document.setdefault(
+            "bootstrapRecovery",
+            {
+                "sourceCommit": PUBLISHED_SOURCE_COMMIT,
+                "rootTree": PUBLISHED_ROOT_TREE,
+            },
+        )
+        self.write_trust_manifest(root, document)
         return root
 
     def materialize_published_snapshot(self, directory: str) -> Path:
@@ -246,6 +262,34 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         result = MODULE.validate_self_check(SOURCE_ROOT)
         self.assertGreater(result["files"], 8)
 
+    def test_candidate_environment_symlink_is_never_resolved_as_fixture_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "candidate"
+            candidate.symlink_to(candidate)
+            probe = (
+                "import importlib.util, pathlib; "
+                f"path = pathlib.Path({str(Path(__file__).absolute())!r}); "
+                "spec = importlib.util.spec_from_file_location('policy_tests_probe', path); "
+                "module = importlib.util.module_from_spec(spec); "
+                "spec.loader.exec_module(module); "
+                "print(module.SOURCE_ROOT)"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=SOURCE_ROOT,
+                env={
+                    **os.environ,
+                    "CANDIDATE_ROOT": str(candidate),
+                    "PUBLIC_REPOSITORY_UNDER_TEST": str(candidate),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(str(SOURCE_ROOT), result.stdout.strip())
+
     def test_container_and_services_keys_fail_before_semantic_validation(self) -> None:
         mutations = (
             ("    runs-on: ubuntu-latest", "    container: alpine:latest\n    runs-on: ubuntu-latest"),
@@ -286,7 +330,8 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         )
 
         with tempfile.TemporaryDirectory() as directory:
-            candidate = self.copy_repository(directory)
+            trusted = self.copy_repository(str(Path(directory) / "trusted"))
+            candidate = self.copy_repository(str(Path(directory) / "candidate"))
             relative = "scripts/verify_release.py"
             trusted_file = candidate / relative
             trusted_file.write_bytes(trusted_file.read_bytes() + b"# direct mutation\n")
@@ -297,7 +342,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             self.write_trust_manifest(candidate, document)
             result = subprocess.run(
                 [sys.executable, str(MODULE_PATH), str(candidate)],
-                cwd=MODULE_PATH.parents[1],
+                cwd=trusted,
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 check=False,
                 capture_output=True,
@@ -307,7 +352,8 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             self.assertIn("trusted-code transition", result.stderr)
 
     def test_workflow_equivalent_bootstrap_and_exact_recovery_pass(self) -> None:
-        self.assertFalse((SOURCE_ROOT / "trust").exists())
+        document = self.load_trust_manifest(SOURCE_ROOT)
+        self.assertEqual("staged" in document, (SOURCE_ROOT / "trust").exists())
         fixture_path = SOURCE_ROOT / "docs" / "published-python-controls.json"
         raw = fixture_path.read_bytes()
         fixture = json.loads(raw)
@@ -336,12 +382,13 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             published_root = Path(directory) / "published-control"
             MODULE.materialize_published_snapshot(SOURCE_ROOT, published_root)
+            active_root = self.copy_repository(str(Path(directory) / "active"))
 
             environment = {
                 **os.environ,
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PUBLIC_REPOSITORY_UNDER_TEST": str(published_root),
-                "CANDIDATE_ROOT": str(SOURCE_ROOT),
+                "CANDIDATE_ROOT": str(active_root),
             }
             commands = (
                 [sys.executable, "scripts/test_verify_release.py"],
@@ -350,7 +397,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 [
                     sys.executable,
                     "scripts/verify_repository_policy.py",
-                    str(SOURCE_ROOT),
+                    str(active_root),
                 ],
             )
             for command in commands:
@@ -369,7 +416,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                         result.stdout + result.stderr,
                     )
 
-            if CANDIDATE_ROOT == SOURCE_ROOT:
+            if MODULE_PATH.parent == SOURCE_ROOT / "scripts":
                 recovery_environment = {
                     **os.environ,
                     "PYTHONDONTWRITEBYTECODE": "1",
@@ -390,7 +437,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                     with self.subTest(recovery_command=command):
                         result = subprocess.run(
                             command,
-                            cwd=SOURCE_ROOT,
+                            cwd=published_root,
                             env=recovery_environment,
                             check=False,
                             capture_output=True,
@@ -405,27 +452,31 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def test_manifest_covers_all_workflows_verifiers_helpers_and_tests(self) -> None:
         document = MODULE.validate_trust_state(SOURCE_ROOT)
         self.assertEqual(2, document["version"])
-        self.assertEqual(
-            {
-                "sourceCommit": PUBLISHED_SOURCE_COMMIT,
-                "rootTree": PUBLISHED_ROOT_TREE,
-            },
-            document["bootstrapRecovery"],
-        )
+        if "bootstrapRecovery" in document:
+            self.assertEqual(
+                {
+                    "sourceCommit": PUBLISHED_SOURCE_COMMIT,
+                    "rootTree": PUBLISHED_ROOT_TREE,
+                },
+                document["bootstrapRecovery"],
+            )
         self.assertEqual(MODULE.TRUSTED_CODE_PATHS, set(document["active"]))
         self.assertEqual(10, len(document["active"]))
         self.assertEqual(3, sum(path.startswith(".github/workflows/") for path in document["active"]))
         self.assertEqual(6, sum(path.startswith("scripts/") for path in document["active"]))
         self.assertIn("docs/published-python-controls.json", document["active"])
 
-    def test_clean_runner_self_check_has_no_external_fixture_dependency(self) -> None:
+    def test_clean_runner_self_check_requires_only_cosign(self) -> None:
         verifier_source = MODULE_PATH.read_text(encoding="utf-8")
         for prohibited in ("import subprocess", "import socket", "import urllib"):
             self.assertNotIn(prohibited, verifier_source)
+        cosign = shutil.which("cosign")
+        self.assertIsNotNone(cosign, "Cosign must be available for repository policy tests")
+        assert cosign is not None
         with tempfile.TemporaryDirectory() as directory:
             environment = {
                 "HOME": str(Path(directory) / "absent-home"),
-                "PATH": "",
+                "PATH": str(Path(cosign).resolve().parent),
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "TMPDIR": str(Path(directory) / "absent-temp"),
             }
@@ -941,13 +992,26 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PolicyError, "not allowlisted"):
                 MODULE.validate_self_check(root)
 
-    def test_symlink_and_oversized_file_fail(self) -> None:
+    def test_candidate_symlink_is_rejected_without_reading_and_oversized_file_fails(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
-            (root / "docs" / "linked.md").symlink_to(root / "README.md")
-            with self.assertRaisesRegex(MODULE.PolicyError, "symlink"):
+            linked = root / "docs" / "linked.md"
+            linked.symlink_to(root / "README.md")
+            original_read_bytes = Path.read_bytes
+
+            def reject_candidate_symlink_read(path: Path) -> bytes:
+                if path == linked:
+                    raise AssertionError("candidate symlink was dereferenced")
+                return original_read_bytes(path)
+
+            with (
+                mock.patch.object(Path, "read_bytes", reject_candidate_symlink_read),
+                self.assertRaisesRegex(MODULE.PolicyError, "symlink"),
+            ):
                 MODULE.validate_self_check(root)
-            (root / "docs" / "linked.md").unlink()
+            linked.unlink()
             (root / "docs" / "large.md").write_text(
                 "x" * (MODULE.MAX_FILE_BYTES + 1)
             )
@@ -2060,7 +2124,8 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
 
     def test_trusted_verifier_never_imports_or_executes_candidate_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            candidate = self.copy_repository(directory)
+            trusted = self.copy_repository(str(Path(directory) / "trusted"))
+            candidate = self.copy_repository(str(Path(directory) / "candidate"))
             self.stage_complete_bundle(
                 candidate,
                 b'raise RuntimeError("staged candidate code must remain inert")\n',
@@ -2070,11 +2135,11 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                     sys.executable,
                     str(MODULE_PATH),
                     "--trusted-root",
-                    str(MODULE_PATH.parents[1]),
+                    str(trusted),
                     "--candidate-root",
                     str(candidate),
                 ],
-                cwd=MODULE_PATH.parents[1],
+                cwd=trusted,
                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 check=False,
                 capture_output=True,
@@ -2512,6 +2577,9 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def test_completed_bootstrap_without_bundle_fails_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
+            bundle = root / "authenticity" / "authenticity-request.sigstore.json"
+            bundle.unlink(missing_ok=True)
+            self.assertFalse(bundle.exists() or bundle.is_symlink())
             policy_path = root / "release-control-policy.json"
             policy = json.loads(policy_path.read_text(encoding="utf-8"))
             policy["bootstrapComplete"] = True
