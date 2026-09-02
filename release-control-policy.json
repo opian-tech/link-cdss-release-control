@@ -4,8 +4,8 @@
   "defaultBranch": "main",
   "maximumApprovalHours": 24,
   "authenticity": {
-    "signingConfigured": true,
-    "expectedCertificateIdentity": "https://github.com/opian-tech/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main",
+    "signingConfigured": false,
+    "expectedCertificateIdentity": "REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY",
     "certificateOidcIssuer": "https://token.actions.githubusercontent.com"
   },
   "roleApprovers": {
