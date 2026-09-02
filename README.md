@@ -26,10 +26,17 @@ Cosign bundle may be committed only after the exact public GitHub repository
 workflow identity is configured and a genuine keyless signature is produced by
 `Sign release set authenticity request` using GitHub Actions OIDC.
 
-The current `release-control-policy.json` is explicitly fail closed for
-authenticity signing because the public repository slug is not yet known. See
-`authenticity/README.md` and `docs/bootstrap.md`; do not substitute a wildcard,
-regular expression, private-repository identity, or fabricated bundle.
+The current hardening PR deliberately leaves authenticity signing unconfigured:
+`authenticity.signingConfigured` is `false` and the certificate identity is the
+literal fail-closed placeholder. After this hardening is trusted on protected
+`main`, the next protected PR must atomically set `signingConfigured` to `true`
+and bind the exact
+`https://github.com/opian-tech/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main`
+identity. The verifier already rejects every other configured identity.
+Bootstrap remains incomplete until that PR, the genuine bundle, and role
+approvers are in place. See `authenticity/README.md` and `docs/bootstrap.md`; do
+not substitute a wildcard, regular expression, foreign-repository identity, or
+fabricated bundle.
 
 Every release manifest must repeat the request's exact
 `releaseSetManifestSha256` and `combinedIdentitySha256` values. The manifest

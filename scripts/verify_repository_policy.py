@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import binascii
 import gzip
@@ -45,11 +46,17 @@ MAX_TOTAL_BYTES = 2 * 1024 * 1024
 MAX_COMMIT_BYTES = 64 * 1024
 MAX_PUBLISHED_ARCHIVE_COMPRESSED_BYTES = 192 * 1024
 MAX_PUBLISHED_ARCHIVE_BYTES = 512 * 1024
+MAX_ASSIGNMENT_MATCHES = 4096
+MAX_SENSITIVE_SCAN_CHARS = MAX_FILE_BYTES
+MAX_JSON_CANDIDATES = 512
+MAX_JSON_NODES = 16384
+MAX_JSON_DEPTH = 128
+MAX_JSON_BYTES = MAX_FILE_BYTES
 PUBLISHED_FIXTURE = "docs/published-python-controls.json"
-PUBLISHED_SOURCE_COMMIT = "6f499c4770770804ace579a1bafec8838949a613"
+PUBLISHED_SOURCE_COMMIT = "16018f5842b4815e283d860b66d8614e0ce13e0a"
 PUBLISHED_ROOT_TREE = "a61a13379f8e4b04612160829526d73c7ed5e1ce"
 APPROVED_PUBLISHED_COMMIT_IDENTITY = (
-    "Link Release Control <release-control@link.invalid>"
+    "zelalemgb <78460729+zelalemgb@users." + "noreply.github.com>"
 )
 PUBLISHED_SNAPSHOT_PATHS = frozenset(
     {
@@ -81,6 +88,11 @@ EXPECTED_WORKFLOWS = {
     "deploy-approved-release.yml",
     "sign-authenticity-request.yml",
     "validate-control.yml",
+}
+TRUSTED_WORKFLOW_SHA256 = {
+    "deploy-approved-release.yml": "f5e251f383993c79f96a3fe7d80ddcdc8980c82ab85fd1c0bfcb0740afe4b304",
+    "sign-authenticity-request.yml": "8dc11b00a53c757ff25910495e858b1822971f2b36e882aab62145c4cb2ce5b0",
+    "validate-control.yml": "12c6efc77b7cec8964ea39c7ee845607027811ca8a9383892ffbb119a6d56638",
 }
 TRUSTED_CODE_PATHS = frozenset(
     {
@@ -148,6 +160,431 @@ class PolicyError(Exception):
     pass
 
 
+ASSIGNMENT_KEY = (
+    r'(?:"(?:\\.|[^"\\])*"|'
+    r"'(?:\\.|[^'\\])*'|"
+    r"[A-Za-z_][A-Za-z0-9_.-]*(?::[A-Za-z_][A-Za-z0-9_.-]*)*)"
+)
+KEY_VALUE_ASSIGNMENT = re.compile(
+    rf"(?:^|(?<=[{{,;\n])|(?<=[ \t]))"
+    rf"[ \t]*(?:-[ \t]+)?(?:export[ \t]+)?(?P<key>{ASSIGNMENT_KEY})"
+    rf"[ \t]*(?::[ \t]*(?:\r?\n[ \t]+)?|=[ \t]*)(?P<value>"
+    rf'"(?:\\.|[^"\\])*"|'
+    rf"'(?:\\.|[^'\\])*'|"
+    rf"<[^>\r\n]*>|\$\{{[A-Za-z_][A-Za-z0-9_]*\}}|"
+    rf"[^,}};\r\n]*?)"
+    rf"(?=[ \t]+(?:export[ \t]+)?{ASSIGNMENT_KEY}[ \t]*[:=]|[,}};\r\n]|$)",
+    re.MULTILINE,
+)
+CREDENTIAL_KEY_SUFFIXES = (
+    "password",
+    "clientsecret",
+    "apikey",
+    "accesstoken",
+)
+IDENTIFIER_KEY_SUFFIXES = tuple(
+    identity_class + suffix
+    for identity_class in ("patient", "clinician", "facility", "tenant", "user")
+    for suffix in ("id", "identifier")
+) + ("mrn",)
+SPACED_KEY_PREFIX = r"(?:[A-Za-z_][A-Za-z0-9_.-]{0,63}[ \t]+){0,4}"
+SPACED_SENSITIVE_KEY = (
+    rf"(?:{SPACED_KEY_PREFIX}(?:password|client[ \t]+secret|api[ \t]+key|access[ \t]+token|"
+    r"patient[ \t]+(?:id|identifier)|clinician[ \t]+(?:id|identifier)|"
+    r"facility[ \t]+(?:id|identifier)|tenant[ \t]+(?:id|identifier)|"
+    r"user[ \t]+(?:id|identifier)|mrn))"
+)
+SENSITIVE_ASSIGNMENT_KEY = rf"(?:{SPACED_SENSITIVE_KEY}|{ASSIGNMENT_KEY})"
+MARKDOWN_NUMBERED_LIST_MARKER = r"[0-9]{1,9}[.)]"
+MARKDOWN_LIST_MARKER = rf"(?:[-+*]|{MARKDOWN_NUMBERED_LIST_MARKER})"
+MARKDOWN_LIST_PREFIX = rf"{MARKDOWN_LIST_MARKER}[ \t]+"
+BOUNDED_LINE_ASSIGNMENT = re.compile(
+    rf"^[ \t]*(?:>[ \t]*)?(?:{MARKDOWN_LIST_PREFIX})?(?:export[ \t]+)?"
+    rf"(?P<key>{SENSITIVE_ASSIGNMENT_KEY})[ \t]*[:=][ \t]*(?P<value>.*?)[ \t]*$",
+    re.IGNORECASE,
+)
+BOUNDED_WRAPPED_ASSIGNMENT = re.compile(
+    rf"^[ \t]*(?:export[ \t]+)?(?P<key>{SENSITIVE_ASSIGNMENT_KEY})"
+    rf"[ \t]*[:=][ \t]*(?P<value>.*?)[ \t]*$",
+    re.IGNORECASE,
+)
+BOUNDED_NUMBERED_LINE_ASSIGNMENT = re.compile(
+    rf"^[ \t]*(?:>[ \t]*)?{MARKDOWN_NUMBERED_LIST_MARKER}[ \t]+"
+    rf"(?:export[ \t]+)?(?P<key>{SENSITIVE_ASSIGNMENT_KEY})"
+    rf"[ \t]*[:=][ \t]*(?P<value>.*?)[ \t]*$",
+    re.IGNORECASE,
+)
+MARKDOWN_INLINE_WRAPPERS = (
+    re.compile(r"(?<!`)(?P<fence>`{1,3})(?P<content>[^`\r\n]+)(?P=fence)(?!`)"),
+    re.compile(r"\*\*(?P<content>[^*\r\n]+)\*\*"),
+    re.compile(r"__(?P<content>[^_\r\n]+)__"),
+)
+MARKDOWN_LABEL_ASSIGNMENTS = (
+    re.compile(
+        rf"^[ \t]*(?:>[ \t]*)?(?:{MARKDOWN_LIST_PREFIX})?"
+        rf"\*\*(?P<key>{SENSITIVE_ASSIGNMENT_KEY})[ \t]*[:=][ \t]*\*\*"
+        rf"[ \t]*(?P<value>.*?)[ \t]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^[ \t]*(?:>[ \t]*)?(?:{MARKDOWN_LIST_PREFIX})?"
+        rf"__(?P<key>{SENSITIVE_ASSIGNMENT_KEY})[ \t]*[:=][ \t]*__"
+        rf"[ \t]*(?P<value>.*?)[ \t]*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^[ \t]*(?:>[ \t]*)?(?:{MARKDOWN_LIST_PREFIX})?"
+        rf"(?P<fence>`{{1,3}})(?P<key>{SENSITIVE_ASSIGNMENT_KEY})"
+        rf"[ \t]*[:=][ \t]*(?P=fence)[ \t]*(?P<value>.*?)[ \t]*$",
+        re.IGNORECASE,
+    ),
+)
+EMPTY_OR_DECLARATION_VALUES = frozenset({"", "null", "none", "str", "string"})
+SAFE_PLACEHOLDER = re.compile(r"(?:<redacted>|\$\{[A-Za-z_][A-Za-z0-9_]*\})", re.IGNORECASE)
+SENSITIVE_CONTENT_PATTERNS = (
+    ("private key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+    ("access token", re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{12,}")),
+    ("cloud access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    (
+        "private network address",
+        re.compile(
+            r"(?<![0-9.])(?:10\.(?:\d{1,3}\.){2}\d{1,3}|"
+            r"192\.168\.(?:\d{1,3}\.)\d{1,3}|"
+            r"172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})(?![0-9.])"
+        ),
+    ),
+    (
+        "personal GitHub noreply identity",
+        re.compile(
+            r"\b(?:\d+\+)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+            r"@users\.noreply\.github\.com\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def normalized_compact_key(key: str) -> str:
+    unquoted = key
+    if key.startswith('"') and key.endswith('"'):
+        try:
+            decoded = json.loads(key)
+        except (json.JSONDecodeError, RecursionError):
+            decoded = key[1:-1]
+        if isinstance(decoded, str):
+            unquoted = decoded
+    elif key.startswith("'") and key.endswith("'"):
+        unquoted = key[1:-1]
+    if (
+        not re.search(r"[A-Za-z0-9]", unquoted)
+        or re.search(r'''[\r\n"'\\=,;{}\[\]`*]''', unquoted)
+    ):
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "", unquoted).lower()
+
+
+def normalized_assignment_value(value: str) -> str:
+    value = strip_yaml_comment(value).strip()
+    if value.endswith(","):
+        value = value[:-1].rstrip()
+    if value[:1] in ("'", '"') and value[-1:] == value[:1]:
+        value = value[1:-1].strip()
+    return value.lower()
+
+
+def sensitive_key_label(key: str) -> str | None:
+    compact_key = normalized_compact_key(key)
+    if any(compact_key.endswith(suffix) for suffix in CREDENTIAL_KEY_SUFFIXES):
+        return "credential assignment"
+    if any(compact_key.endswith(suffix) for suffix in IDENTIFIER_KEY_SUFFIXES):
+        return "synthetic PHI marker"
+    return None
+
+
+def safe_assignment_value(value: str) -> bool:
+    normalized = normalized_assignment_value(value)
+    return (
+        normalized in EMPTY_OR_DECLARATION_VALUES
+        or SAFE_PLACEHOLDER.fullmatch(normalized) is not None
+    )
+
+
+def explicit_safe_placeholder(value: str) -> bool:
+    normalized = normalized_assignment_value(value)
+    return SAFE_PLACEHOLDER.fullmatch(normalized) is not None
+
+
+def sensitive_indented_container_label(text: str) -> str | None:
+    lines = text.splitlines()
+    empty_sensitive_keys: list[tuple[int, str]] = []
+    key_pattern = re.compile(
+        rf"^(?P<indent>[ \t]*)(?:-[ \t]+)?(?P<key>{SENSITIVE_ASSIGNMENT_KEY})"
+        rf"[ \t]*:[ \t]*(?P<value>.*)$",
+        re.IGNORECASE,
+    )
+    mapping_pattern = re.compile(
+        rf"(?:-[ \t]+)?{SENSITIVE_ASSIGNMENT_KEY}[ \t]*:", re.IGNORECASE
+    )
+    sequence_pattern = re.compile(r"-[ \t]+\S")
+
+    for line in lines:
+        stripped = line.lstrip(" \t")
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line[: len(line) - len(stripped)].expandtabs(8))
+        while empty_sensitive_keys and indent <= empty_sensitive_keys[-1][0]:
+            empty_sensitive_keys.pop()
+        if empty_sensitive_keys:
+            if sequence_pattern.match(stripped) or mapping_pattern.match(stripped):
+                return empty_sensitive_keys[-1][1]
+            label = empty_sensitive_keys.pop()[1]
+            if not explicit_safe_placeholder(stripped):
+                return label
+
+        key_match = key_pattern.match(line)
+        if key_match is None or strip_yaml_comment(key_match.group("value")).strip():
+            continue
+        label = sensitive_key_label(key_match.group("key"))
+        if label is not None:
+            empty_sensitive_keys.append((indent, label))
+    return None
+
+
+def sensitive_json_label(text: str) -> str | None:
+    decoder = json.JSONDecoder()
+    pending: list[tuple[object, int]] = []
+    decoded_through = -1
+    candidate_count = 0
+    decoded_bytes = 0
+
+    def consume_candidate(candidate: str | None = None) -> None:
+        nonlocal candidate_count, decoded_bytes
+        candidate_count += 1
+        if candidate is not None:
+            decoded_bytes += len(candidate.encode("utf-8"))
+        if candidate_count > MAX_JSON_CANDIDATES:
+            raise PolicyError(
+                "JSON sensitive-content scan exceeds structural bounds (candidate bound)"
+            )
+        if decoded_bytes > MAX_JSON_BYTES:
+            raise PolicyError(
+                "JSON sensitive-content scan exceeds structural bounds (byte bound)"
+            )
+
+    document_start = len(text) - len(text.lstrip())
+    if document_start < len(text):
+        try:
+            document, end = decoder.raw_decode(text, document_start)
+        except json.JSONDecodeError:
+            pass
+        except (RecursionError, ValueError) as error:
+            raise PolicyError("JSON sensitive-content scan exceeds structural bounds") from error
+        else:
+            if not text[end:].strip():
+                consume_candidate(text[document_start:end])
+                pending.append((document, 0))
+                decoded_through = end
+
+    for candidate in re.finditer(
+        r'\{(?=[ \t\r\n]*(?:["}]))|\[(?=[ \t\r\n]*(?:["{\[tfn0-9\]-]))', text
+    ):
+        start = candidate.start()
+        if start < decoded_through:
+            continue
+        try:
+            document, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            consume_candidate()
+            continue
+        except (RecursionError, ValueError) as error:
+            raise PolicyError("JSON sensitive-content scan exceeds structural bounds") from error
+        consume_candidate(text[start:end])
+        pending.append((document, 0))
+        decoded_through = end
+
+    nodes = 0
+    while pending:
+        value, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+            raise PolicyError("JSON sensitive-content scan exceeds structural bounds")
+        if isinstance(value, dict):
+            for key, child in value.items():
+                label = sensitive_key_label(key)
+                if label is not None:
+                    if isinstance(child, (dict, list)):
+                        return label
+                    if not isinstance(child, str) or not safe_assignment_value(child):
+                        if child is not None:
+                            return label
+                pending.append((child, depth + 1))
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value)
+        elif isinstance(value, str):
+            candidate = value.strip()
+            if re.match(
+                r'^(?:\{(?=[ \t\r\n]*(?:["}]))|\[(?=[ \t\r\n]*(?:["{\[tfn0-9\]-])))',
+                candidate,
+            ) is None:
+                continue
+            consume_candidate(candidate)
+            try:
+                decoded, end = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            except (RecursionError, ValueError) as error:
+                raise PolicyError(
+                    "JSON sensitive-content scan exceeds structural bounds"
+                ) from error
+            if end == len(candidate) and isinstance(decoded, (dict, list)):
+                pending.append((decoded, depth + 1))
+    return None
+
+
+def sensitive_assignment_label(text: str) -> str | None:
+    for match_count, assignment in enumerate(
+        KEY_VALUE_ASSIGNMENT.finditer(text), start=1
+    ):
+        if match_count > MAX_ASSIGNMENT_MATCHES:
+            raise PolicyError("sensitive assignment scan exceeds its match bound")
+        if safe_assignment_value(assignment.group("value")):
+            continue
+        label = sensitive_key_label(assignment.group("key"))
+        if label is not None:
+            return label
+    return None
+
+
+def sensitive_bounded_assignment_label(text: str) -> str | None:
+    lines = text.splitlines()
+    candidates = [(line, BOUNDED_LINE_ASSIGNMENT) for line in lines]
+    wrapper_matches = 0
+    for pattern in MARKDOWN_INLINE_WRAPPERS:
+        for match in pattern.finditer(text):
+            wrapper_matches += 1
+            if wrapper_matches > MAX_ASSIGNMENT_MATCHES:
+                raise PolicyError("Markdown assignment scan exceeds its match bound")
+            candidates.append(
+                (match.group("content").strip(), BOUNDED_WRAPPED_ASSIGNMENT)
+            )
+
+    for raw_line in lines:
+        line = raw_line[:-1] if raw_line.endswith("\\") else raw_line
+        for assignment_pattern in MARKDOWN_LABEL_ASSIGNMENTS:
+            assignment = assignment_pattern.fullmatch(line)
+            if assignment is None or safe_assignment_value(assignment.group("value")):
+                continue
+            label = sensitive_key_label(assignment.group("key"))
+            if label is not None:
+                return label
+
+    for candidate, assignment_pattern in candidates:
+        assignment = assignment_pattern.fullmatch(candidate)
+        if assignment is None or safe_assignment_value(assignment.group("value")):
+            continue
+        label = sensitive_key_label(assignment.group("key"))
+        if label is not None:
+            return label
+    return None
+
+
+def sensitive_markdown_continuation_label(text: str) -> str | None:
+    lines = text.splitlines()
+    prefix_pattern = re.compile(
+        rf"^(?P<outer_indent>[ \t]*)(?P<quote>>[ \t]?)?(?P<inner_indent>[ \t]*)"
+        rf"(?:(?P<marker>{MARKDOWN_LIST_MARKER})(?P<spacing>[ \t]+))?"
+        rf"(?P<body>.*)$"
+    )
+    block_start = re.compile(
+        rf"(?:{MARKDOWN_LIST_PREFIX}|#{{1,6}}[ \t]+|`{{3,}}|~{{3,}})"
+    )
+    match_count = 0
+
+    for index, raw_line in enumerate(lines[:-1]):
+        label_line = raw_line[:-1] if raw_line.endswith("\\") else raw_line
+        assignment = None
+        for assignment_pattern in (
+            *MARKDOWN_LABEL_ASSIGNMENTS,
+            BOUNDED_NUMBERED_LINE_ASSIGNMENT,
+        ):
+            assignment = assignment_pattern.fullmatch(label_line)
+            if assignment is not None:
+                break
+        if assignment is None or normalized_assignment_value(
+            assignment.group("value")
+        ):
+            continue
+        label = sensitive_key_label(assignment.group("key"))
+        if label is None:
+            continue
+
+        match_count += 1
+        if match_count > MAX_ASSIGNMENT_MATCHES:
+            raise PolicyError("Markdown continuation scan exceeds its match bound")
+        prefix = prefix_pattern.fullmatch(label_line)
+        if prefix is None:
+            continue
+        continuation = prefix_pattern.fullmatch(lines[index + 1])
+        if continuation is None or not continuation.group("body").strip():
+            continue
+        if bool(continuation.group("quote")) != bool(prefix.group("quote")):
+            continue
+
+        continuation_indent = len(
+            (
+                continuation.group("outer_indent")
+                + continuation.group("inner_indent")
+            ).expandtabs(8)
+        )
+        label_indent = len(
+            (prefix.group("outer_indent") + prefix.group("inner_indent")).expandtabs(8)
+        )
+        marker = prefix.group("marker")
+        if marker is not None:
+            required_indent = (
+                label_indent
+                + len(marker)
+                + len(prefix.group("spacing").expandtabs(8))
+            )
+            if continuation_indent < required_indent:
+                continue
+        elif continuation_indent < label_indent or block_start.match(
+            continuation.group("body")
+        ):
+            continue
+
+        value = continuation.group("body").strip()
+        if value.endswith("\\"):
+            value = value[:-1].rstrip()
+        if not explicit_safe_placeholder(value):
+            return label
+    return None
+
+
+def sensitive_content_label(text: str) -> str | None:
+    if len(text) > MAX_SENSITIVE_SCAN_CHARS:
+        raise PolicyError("sensitive-content scan exceeds its size bound")
+    label = sensitive_json_label(text)
+    if label is not None:
+        return label
+    label = sensitive_indented_container_label(text)
+    if label is not None:
+        return label
+    label = sensitive_assignment_label(text)
+    if label is not None:
+        return label
+    label = sensitive_bounded_assignment_label(text)
+    if label is not None:
+        return label
+    label = sensitive_markdown_continuation_label(text)
+    if label is not None:
+        return label
+    for label, pattern in SENSITIVE_CONTENT_PATTERNS:
+        if pattern.search(text):
+            return label
+    return None
+
+
 def repository_files(root: Path) -> list[Path]:
     if root.is_symlink() or not root.is_dir():
         raise PolicyError("repository root must be a non-symlink directory")
@@ -182,14 +619,6 @@ def repository_files(root: Path) -> list[Path]:
 
 
 def scan_sensitive_content(root: Path, files: list[Path]) -> None:
-    private_key = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
-    token_prefix = re.compile(r"\b(?:gh" + r"[pousr]|github_pat)_[A-Za-z0-9_]{12,}")
-    aws_key = re.compile(r"\bAKIA[0-9A-Z]{16}\b")
-    private_ipv4 = re.compile(
-        r"(?<![0-9.])(?:10\.(?:\d{1,3}\.){2}\d{1,3}|"
-        r"192\.168\.(?:\d{1,3}\.)\d{1,3}|"
-        r"172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})(?![0-9.])"
-    )
     high_risk_names = re.compile(
         r"(?:^|/)(?:\.env(?:\..*)?|id_(?:rsa|ed25519)|credentials?|secrets?|"
         r"patient-export|clinical-export)(?:$|[./])",
@@ -203,14 +632,9 @@ def scan_sensitive_content(root: Path, files: list[Path]) -> None:
             content = path.read_text(encoding="utf-8")
         except UnicodeError as error:
             raise PolicyError(f"non-UTF-8 content is prohibited: {relative}") from error
-        for label, pattern in (
-            ("private key", private_key),
-            ("access token", token_prefix),
-            ("cloud access key", aws_key),
-            ("private network address", private_ipv4),
-        ):
-            if pattern.search(content):
-                raise PolicyError(f"possible {label} found in {relative}")
+        label = sensitive_content_label(content)
+        if label is not None:
+            raise PolicyError(f"possible {label} found in {relative}")
 
 
 def scan_sensitive_bytes(relative: str, content: bytes) -> None:
@@ -218,68 +642,52 @@ def scan_sensitive_bytes(relative: str, content: bytes) -> None:
         text = content.decode("utf-8")
     except UnicodeError as error:
         raise PolicyError(f"published archive member is not UTF-8: {relative}") from error
-    patterns = (
-        ("private key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
-        ("access token", re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{12,}")),
-        ("cloud access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-        (
-            "credential assignment",
-            re.compile(
-                r"(?im)\b(?:password|client_secret|api_?key|access_?token)"
-                r"\s*[:=]\s*[\"'][^\"'\r\n]{8,128}[\"']"
-            ),
-        ),
-        (
-            "private network address",
-            re.compile(
-                r"(?<![0-9.])(?:10\.(?:\d{1,3}\.){2}\d{1,3}|"
-                r"192\.168\.(?:\d{1,3}\.)\d{1,3}|"
-                r"172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})(?![0-9.])"
-            ),
-        ),
-        (
-            "synthetic PHI marker",
-            re.compile(
-                r"(?im)\b(?:mrn|patient_?id|patientId)\s*[:=]\s*[\"']"
-                r"[A-Za-z0-9][A-Za-z0-9-]{2,63}[\"']"
-            ),
-        ),
-        (
-            "personal GitHub noreply identity",
-            re.compile(
-                r"\b(?:\d+\+)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
-                r"@users\.noreply\.github\.com\b",
-                re.IGNORECASE,
-            ),
-        ),
-    )
-    for label, pattern in patterns:
-        if pattern.search(text):
-            raise PolicyError(f"possible {label} found in published archive member: {relative}")
+    label = sensitive_content_label(text)
+    if label is not None:
+        raise PolicyError(f"possible {label} found in published archive member: {relative}")
 
 
 def validate_published_commit_headers(commit_bytes: bytes) -> str:
-    scan_sensitive_bytes("source commit", commit_bytes)
     try:
         commit_text = commit_bytes.decode("utf-8")
     except UnicodeError as error:
         raise PolicyError("published source commit is not UTF-8") from error
-    headers, separator, _ = commit_text.partition("\n\n")
+    headers, separator, message = commit_text.partition("\n\n")
     if not separator:
+        scan_sensitive_bytes("source commit", commit_bytes)
         raise PolicyError("published source commit has no message separator")
     header_lines = headers.splitlines()
+    approved_identity_lines: set[int] = set()
     for kind in ("author", "committer"):
-        matching = [line for line in header_lines if line.startswith(f"{kind} ")]
+        matching = [
+            (index, line)
+            for index, line in enumerate(header_lines)
+            if line.startswith(f"{kind} ")
+        ]
         if len(matching) != 1:
+            scan_sensitive_bytes("source commit", commit_bytes)
             raise PolicyError(f"published source commit must have exactly one {kind} header")
         expected = re.compile(
             rf"{kind} {re.escape(APPROVED_PUBLISHED_COMMIT_IDENTITY)} "
             r"\d+ [+-]\d{4}"
         )
-        if expected.fullmatch(matching[0]) is None:
+        index, line = matching[0]
+        if expected.fullmatch(line) is None:
+            scan_sensitive_bytes("source commit", commit_bytes)
             raise PolicyError(
-                f"published source commit {kind} must use the approved neutral project identity"
+                f"published source commit {kind} must use the exact approved public identity"
             )
+        approved_identity_lines.add(index)
+
+    sanitized_headers = "\n".join(
+        f"{line.split(' ', 1)[0]} <approved-public-identity>"
+        if index in approved_identity_lines
+        else line
+        for index, line in enumerate(header_lines)
+    )
+    scan_sensitive_bytes(
+        "source commit", f"{sanitized_headers}\n\n{message}".encode("utf-8")
+    )
     return commit_text
 
 
@@ -299,6 +707,71 @@ def strip_yaml_comment(line: str) -> str:
         ):
             return line[:index]
     return line
+
+
+def validate_privileged_workflow_yaml_subset(workflow: str, workflow_name: str) -> None:
+    block_indent: int | None = None
+    plain_key = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+    mapping = re.compile(r"(?P<list>-\s+)?(?P<key>[^:]+):(?P<value>.*)")
+
+    for number, raw in enumerate(workflow.splitlines(), start=1):
+        if "\t" in raw[: len(raw) - len(raw.lstrip())]:
+            raise PolicyError(
+                f"privileged workflow YAML indentation cannot contain tabs in {workflow_name} at line {number}"
+            )
+        content = strip_yaml_comment(raw).rstrip()
+        if not content.strip():
+            continue
+        indent = len(content) - len(content.lstrip(" "))
+        if block_indent is not None:
+            if indent > block_indent:
+                continue
+            block_indent = None
+
+        stripped = content[indent:]
+        node = stripped[2:].lstrip() if stripped.startswith("- ") else stripped
+        if (
+            node.startswith(("---", "...", "%", "? ", "!", "&", "*", "[", "{"))
+            or stripped == "?"
+        ):
+            raise PolicyError(
+                f"privileged workflow uses advanced YAML syntax in {workflow_name} at line {number}"
+            )
+
+        match = mapping.fullmatch(stripped)
+        if match is None:
+            if stripped.startswith("- ") and plain_key.fullmatch(node):
+                continue
+            raise PolicyError(
+                f"privileged workflow is outside the strict YAML subset in {workflow_name} at line {number}"
+            )
+
+        key = match.group("key").strip()
+        value = match.group("value").strip()
+        if key == "<<":
+            raise PolicyError(
+                f"privileged workflow merge keys are prohibited in {workflow_name} at line {number}"
+            )
+        if key.startswith(("'", '"')):
+            raise PolicyError(
+                f"privileged workflow quoted mapping keys are prohibited in {workflow_name} at line {number}"
+            )
+        if "\\" in key or plain_key.fullmatch(key) is None:
+            raise PolicyError(
+                f"privileged workflow mapping keys must be plain ASCII in {workflow_name} at line {number}"
+            )
+        if value.startswith(("!", "&", "*")):
+            raise PolicyError(
+                f"privileged workflow node properties and aliases are prohibited in {workflow_name} at line {number}"
+            )
+        if value.startswith(("[", "{")) and not (
+            key == "permissions" and value == "{}"
+        ):
+            raise PolicyError(
+                f"privileged workflow flow collections are prohibited in {workflow_name} at line {number}"
+            )
+        if re.fullmatch(r"[|>]\s*(?:[-+]?[1-9])?", value):
+            block_indent = indent
 
 
 def workflow_lines(workflow: str) -> list[tuple[int, int, str]]:
@@ -347,11 +820,263 @@ def active_shell_blocks(workflow: str) -> list[list[str]]:
     return blocks
 
 
+def executable_step_inventory(
+    workflow: str, workflow_name: str
+) -> list[tuple[str, str, str, str | None]]:
+    records: list[dict[str, object]] = []
+    current_job: str | None = None
+    current_step: dict[str, object] | None = None
+    in_steps = False
+    key_pattern = re.compile(
+        r"(?P<list>-\s+)?(?:"
+        r"(?P<uses>uses|'uses'|\"uses\")|"
+        r"(?P<run>run|'run'|\"run\")|"
+        r"(?P<shell>shell|'shell'|\"shell\")"
+        r")\s*:\s*(?P<value>.*)"
+    )
+
+    for number, indent, content in workflow_lines(workflow):
+        job = re.fullmatch(r"([A-Za-z0-9_-]+):", content)
+        if indent == 2 and job:
+            current_job = job.group(1)
+            current_step = None
+            in_steps = False
+            continue
+        if current_job is not None and indent == 4 and content == "steps:":
+            current_step = None
+            in_steps = True
+            continue
+        if current_job is not None and indent <= 4:
+            current_step = None
+            in_steps = False
+
+        if in_steps and indent == 6 and content.startswith("- "):
+            current_step = {
+                "job": current_job,
+                "executable": None,
+                "shells": [],
+            }
+            records.append(current_step)
+
+        match = key_pattern.fullmatch(content)
+        if match is None:
+            continue
+        expected_indent = 6 if match.group("list") else 8
+        if not in_steps or current_step is None or indent != expected_indent:
+            raise PolicyError(
+                f"executable step key is outside the expected structure in {workflow_name} at line {number}"
+            )
+
+        value = scalar_value(match.group("value"))
+        if match.group("shell"):
+            shells = current_step["shells"]
+            assert isinstance(shells, list)
+            shells.append(value)
+            continue
+
+        if current_step["executable"] is not None:
+            raise PolicyError(
+                f"workflow step has multiple executable declarations in {workflow_name} at line {number}"
+            )
+        kind = "uses" if match.group("uses") else "run"
+        current_step["executable"] = (kind, value)
+
+    inventory: list[tuple[str, str, str, str | None]] = []
+    for record in records:
+        executable = record["executable"]
+        shells = record["shells"]
+        assert isinstance(shells, list)
+        if executable is None:
+            if shells:
+                raise PolicyError(
+                    f"non-executable step declares a shell in {workflow_name}"
+                )
+            continue
+        kind, value = executable
+        expected_shells = ["bash"] if kind == "run" else []
+        if shells != expected_shells:
+            raise PolicyError(
+                f"workflow executable-step shell declaration is invalid in {workflow_name}"
+            )
+        job = record["job"]
+        assert isinstance(job, str)
+        inventory.append((job, kind, value, shells[0] if shells else None))
+    return inventory
+
+
+def expected_signing_executable_steps() -> list[tuple[str, str, str, str | None]]:
+    return [
+        ("sign", "uses", f"actions/checkout@{ACTION_REFS['actions/checkout']}", None),
+        (
+            "sign",
+            "uses",
+            f"sigstore/cosign-installer@{ACTION_REFS['sigstore/cosign-installer']}",
+            None,
+        ),
+        ("sign", "run", "|", "bash"),
+        (
+            "sign",
+            "uses",
+            f"actions/upload-artifact@{ACTION_REFS['actions/upload-artifact']}",
+            None,
+        ),
+    ]
+
+
+def expected_deployment_executable_steps() -> list[tuple[str, str, str, str | None]]:
+    return [
+        ("gate", "uses", f"actions/checkout@{ACTION_REFS['actions/checkout']}", None),
+        (
+            "gate",
+            "uses",
+            f"sigstore/cosign-installer@{ACTION_REFS['sigstore/cosign-installer']}",
+            None,
+        ),
+        ("gate", "run", "|", "bash"),
+        ("gate", "run", "|", "bash"),
+        ("deploy-staging", "run", "|", "bash"),
+        ("deploy-prod", "run", "|", "bash"),
+    ]
+
+
 def contains_sequence(block: list[str], expected: tuple[str, ...]) -> bool:
     return any(
         tuple(block[index : index + len(expected)]) == expected
         for index in range(len(block) - len(expected) + 1)
     )
+
+
+def expected_signing_shell_blocks() -> list[list[str]]:
+    return [
+        [
+            "set -euo pipefail",
+            'request="authenticity/authenticity-request.json"',
+            'bundle="$RUNNER_TEMP/authenticity-request.sigstore.json"',
+            'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+            'git ls-files --error-unmatch -- "$request" >/dev/null',
+            "python3 scripts/verify_authenticity.py \\",
+            "--request \"$request\" \\",
+            "--policy release-control-policy.json",
+            "test \"$(jq -r '.authenticity.signingConfigured' release-control-policy.json)\" = \"true\"",
+            "identity=\"$(jq -r '.authenticity.expectedCertificateIdentity' release-control-policy.json)\"",
+            "issuer=\"$(jq -r '.authenticity.certificateOidcIssuer' release-control-policy.json)\"",
+            'test "$identity" != "REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY"',
+            'test "$identity" = "https://github.com/$GITHUB_REPOSITORY/.github/workflows/sign-authenticity-request.yml@refs/heads/main"',
+            'test "$issuer" = "https://token.actions.githubusercontent.com"',
+            'cosign sign-blob --yes --bundle "$bundle" "$request"',
+            "cosign verify-blob \\",
+            "--bundle \"$bundle\" \\",
+            "--certificate-identity \"$identity\" \\",
+            "--certificate-oidc-issuer \"$issuer\" \\",
+            '"$request"',
+            'cp -- "$request" "$RUNNER_TEMP/authenticity-request.json"',
+        ]
+    ]
+
+
+def expected_deployment_shell_blocks() -> list[list[str]]:
+    authenticity = [
+        "set -euo pipefail",
+        "git ls-files --error-unmatch -- \\",
+        "authenticity/authenticity-request.json \\",
+        "authenticity/authenticity-request.sigstore.json >/dev/null",
+        "python3 scripts/verify_authenticity.py \\",
+        "--request authenticity/authenticity-request.json \\",
+        "--bundle authenticity/authenticity-request.sigstore.json \\",
+        "--policy release-control-policy.json \\",
+        "--cosign cosign",
+    ]
+    release = [
+        "set -euo pipefail",
+        '[[ "$MANIFEST_PATH" =~ ^releases/rel-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}\\.json$ ]]',
+        'git ls-files --error-unmatch -- "$MANIFEST_PATH" >/dev/null',
+        'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        'test "$(jq -r \'.environment\' "$MANIFEST_PATH")" = "$REQUESTED_ENVIRONMENT"',
+        'release_set_manifest_sha256="$(jq -er \'.releaseSetManifestSha256\' authenticity/authenticity-request.json)"',
+        'combined_identity_sha256="$(jq -er \'.combinedIdentitySha256\' authenticity/authenticity-request.json)"',
+        'test "$(jq -er \'.releaseSetManifestSha256\' "$MANIFEST_PATH")" = "$release_set_manifest_sha256"',
+        'test "$(jq -er \'.combinedIdentitySha256\' "$MANIFEST_PATH")" = "$combined_identity_sha256"',
+        'report="$RUNNER_TEMP/approval-report.json"',
+        "python3 scripts/verify_release.py \\",
+        '--manifest "$MANIFEST_PATH" \\',
+        '--repository "$GITHUB_REPOSITORY" \\',
+        '--initiator "$GITHUB_ACTOR" \\',
+        '--output "$report"',
+        'jq -e \'.result == "verified" and .approvalCount == 3\' "$report" >/dev/null',
+        'test "$(jq -er \'.releaseSetManifestSha256\' "$report")" = "$release_set_manifest_sha256"',
+        'test "$(jq -er \'.combinedIdentitySha256\' "$report")" = "$combined_identity_sha256"',
+        "{",
+        'echo "release_id=$(jq -r \'.releaseId\' "$report")"',
+        'echo "environment=$(jq -r \'.environment\' "$report")"',
+        'echo "source_commit=$(jq -r \'.sourceCommit\' "$report")"',
+        'echo "manifest_sha256=$(jq -r \'.manifestSha256\' "$report")"',
+        'echo "api_sha256=$(jq -r \'.artifactDigests.apiSha256\' "$report")"',
+        'echo "collector_sha256=$(jq -r \'.artifactDigests.collectorSha256\' "$report")"',
+        'echo "alertmanager_sha256=$(jq -r \'.artifactDigests.alertmanagerSha256\' "$report")"',
+        'echo "source_review_sha256=$(jq -r \'.sourceReviewEvidenceSha256\' "$report")"',
+        'echo "clinical_safety_sha256=$(jq -r \'.clinicalSafetyEvidenceSha256\' "$report")"',
+        'echo "promotion_sha256=$(jq -r \'.promotionEvidenceSha256\' "$report")"',
+        'echo "release_set_manifest_sha256=$release_set_manifest_sha256"',
+        'echo "combined_identity_sha256=$combined_identity_sha256"',
+        'echo "staging_manifest_sha256=$(jq -r \'.stagingManifestSha256 // "none"\' "$report")"',
+        '} >> "$GITHUB_OUTPUT"',
+        'rm -f -- "$report"',
+    ]
+
+    def deploy(environment: str) -> list[str]:
+        staging_digest = (
+            'none >"$stdout" 2>"$stderr"; then'
+            if environment == "staging"
+            else '"${{ needs.gate.outputs.staging_manifest_sha256 }}" \\'
+        )
+        lines = [
+            "set -euo pipefail",
+            '[[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9.-]+$ ]]',
+            '[[ "$DEPLOY_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]{0,31}$ ]]',
+            'test -n "$DEPLOY_SSH_PRIVATE_KEY"',
+            'test -n "$DEPLOY_KNOWN_HOSTS"',
+            "umask 077",
+            'key="$RUNNER_TEMP/deploy-key"',
+            'known_hosts="$RUNNER_TEMP/known-hosts"',
+            'stdout="$RUNNER_TEMP/deploy.out"',
+            'stderr="$RUNNER_TEMP/deploy.err"',
+            'trap \'rm -f -- "$key" "$known_hosts" "$stdout" "$stderr"\' EXIT',
+            'printf \'%s\\n\' "$DEPLOY_SSH_PRIVATE_KEY" > "$key"',
+            'printf \'%s\\n\' "$DEPLOY_KNOWN_HOSTS" > "$known_hosts"',
+            'chmod 600 "$key" "$known_hosts"',
+            'if ! ssh -T -i "$key" -o BatchMode=yes -o StrictHostKeyChecking=yes \\',
+            '-o UserKnownHostsFile="$known_hosts" -o ConnectTimeout=15 \\',
+            '"$DEPLOY_USER@$DEPLOY_HOST" \\',
+            "/usr/local/libexec/link/deploy-approved-release \\",
+            f"--environment {environment} \\",
+            '--release-id "${{ needs.gate.outputs.release_id }}" \\',
+            '--source-commit "${{ needs.gate.outputs.source_commit }}" \\',
+            '--manifest-sha256 "${{ needs.gate.outputs.manifest_sha256 }}" \\',
+            '--api-sha256 "${{ needs.gate.outputs.api_sha256 }}" \\',
+            '--collector-sha256 "${{ needs.gate.outputs.collector_sha256 }}" \\',
+            '--alertmanager-sha256 "${{ needs.gate.outputs.alertmanager_sha256 }}" \\',
+            '--source-review-sha256 "${{ needs.gate.outputs.source_review_sha256 }}" \\',
+            '--clinical-safety-sha256 "${{ needs.gate.outputs.clinical_safety_sha256 }}" \\',
+            '--promotion-sha256 "${{ needs.gate.outputs.promotion_sha256 }}" \\',
+            '--release-set-manifest-sha256 "${{ needs.gate.outputs.release_set_manifest_sha256 }}" \\',
+            '--combined-identity-sha256 "${{ needs.gate.outputs.combined_identity_sha256 }}" \\',
+            f"--staging-manifest-sha256 {staging_digest}",
+        ]
+        if environment == "prod":
+            lines.append('>"$stdout" 2>"$stderr"; then')
+        title = "Staging" if environment == "staging" else "Production"
+        lines.extend(
+            [
+                f'echo "::error::{title} deployment failed; inspect protected host evidence"',
+                "exit 1",
+                "fi",
+                'grep -qx \'RELEASE_DEPLOYMENT_SUCCEEDED\' "$stdout"',
+                f'echo "{title} deployment completed"',
+            ]
+        )
+        return lines
+
+    return [authenticity, release, deploy("staging"), deploy("prod")]
 
 
 def canonical_json_bytes(document: dict[str, object]) -> bytes:
@@ -904,6 +1629,101 @@ def parse_permissions(
     return {"workflow": top_level, "jobs": jobs}
 
 
+def checkout_step_inventory(
+    workflow: str,
+) -> list[tuple[str, str, str, str, str, str, str]]:
+    records: list[tuple[str, list[tuple[int, int, str]]]] = []
+    current_job: str | None = None
+    current_step: list[tuple[int, int, str]] | None = None
+    in_steps = False
+
+    for number, indent, content in workflow_lines(workflow):
+        job = re.fullmatch(r"([A-Za-z0-9_-]+):", content)
+        if indent == 2 and job:
+            current_job = job.group(1)
+            current_step = None
+            in_steps = False
+            continue
+        if current_job is not None and indent == 4 and content == "steps:":
+            current_step = None
+            in_steps = True
+            continue
+        if current_job is not None and indent <= 4:
+            current_step = None
+            in_steps = False
+        if in_steps and indent == 6 and content.startswith("- "):
+            current_step = []
+            records.append((current_job, current_step))
+        elif in_steps and current_step is not None and indent > 6:
+            current_step.append((number, indent, content))
+
+    inventory: list[tuple[str, str, str, str, str, str, str]] = []
+    checkout = f"actions/checkout@{ACTION_REFS['actions/checkout']}"
+    key_value = re.compile(r"([A-Za-z][A-Za-z0-9-]*):\s*(.*)")
+    expected_inputs = {
+        "repository",
+        "ref",
+        "path",
+        "fetch-depth",
+        "persist-credentials",
+    }
+    for job, lines in records:
+        direct: dict[str, tuple[int, str]] = {}
+        for number, indent, content in lines:
+            if indent != 8:
+                continue
+            match = key_value.fullmatch(content)
+            if match is None:
+                continue
+            key, value = match.groups()
+            if key in direct:
+                raise PolicyError(
+                    f"duplicate checkout step key in validate-control.yml at line {number}"
+                )
+            direct[key] = (number, scalar_value(value))
+        uses = direct.get("uses")
+        if uses is None or uses[1] != checkout:
+            continue
+        with_entry = direct.get("with")
+        if with_entry is None or with_entry[1]:
+            raise PolicyError("checkout step must declare an exact with mapping")
+
+        with_line = with_entry[0]
+        inputs: dict[str, str] = {}
+        for number, indent, content in lines:
+            if number <= with_line:
+                continue
+            if indent <= 8:
+                break
+            if indent != 10:
+                raise PolicyError(
+                    f"checkout inputs must be exact scalar mappings at line {number}"
+                )
+            match = key_value.fullmatch(content)
+            if match is None:
+                raise PolicyError(f"checkout input is malformed at line {number}")
+            key, value = match.groups()
+            if key not in expected_inputs or key in inputs:
+                raise PolicyError(
+                    f"checkout input mapping is not allowlisted at line {number}"
+                )
+            inputs[key] = scalar_value(value)
+        if set(inputs) != expected_inputs:
+            raise PolicyError("checkout step must declare the exact input mapping")
+        inventory.append(
+            (
+                job,
+                uses[1],
+                inputs["repository"],
+                inputs["ref"],
+                inputs["path"],
+                inputs["fetch-depth"],
+                inputs["persist-credentials"],
+            )
+        )
+    return inventory
+
+
 def validate_control_validation_workflow(validation: str) -> None:
     required = (
         "pull_request_target:",
@@ -939,6 +1759,50 @@ def validate_control_validation_workflow(validation: str) -> None:
                 f"validation workflow trusted path/ref count is invalid: {value}"
             )
 
+    checkout = f"actions/checkout@{ACTION_REFS['actions/checkout']}"
+    expected_checkouts = [
+        (
+            "validate-pull-request",
+            checkout,
+            "${{ github.repository }}",
+            "${{ github.event.pull_request.base.sha }}",
+            "trusted",
+            "1",
+            "false",
+        ),
+        (
+            "validate-pull-request",
+            checkout,
+            "${{ github.event.pull_request.head.repo.full_name }}",
+            "${{ github.event.pull_request.head.sha }}",
+            "candidate",
+            "1",
+            "false",
+        ),
+        (
+            "validate-main",
+            checkout,
+            "${{ github.repository }}",
+            "${{ github.event.before }}",
+            "trusted",
+            "1",
+            "false",
+        ),
+        (
+            "validate-main",
+            checkout,
+            "${{ github.repository }}",
+            "${{ github.sha }}",
+            "candidate",
+            "1",
+            "false",
+        ),
+    ]
+    if checkout_step_inventory(validation) != expected_checkouts:
+        raise PolicyError(
+            "validation workflow checkout steps must preserve exact trust associations"
+        )
+
     run_commands = [
         scalar_value(match.group(1))
         for _, _, line in workflow_lines(validation)
@@ -971,7 +1835,56 @@ def validate_control_validation_workflow(validation: str) -> None:
             )
 
 
-def validate_workflows(root: Path) -> None:
+def validate_workflow_digest_mapping(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != EXPECTED_WORKFLOWS:
+        raise PolicyError("trusted workflow digest binding must cover exactly all workflows")
+    mapping: dict[str, str] = {}
+    for name, digest in value.items():
+        if not isinstance(name, str) or not isinstance(digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", digest
+        ) is None:
+            raise PolicyError("trusted workflow digest binding is malformed")
+        mapping[name] = digest
+    return mapping
+
+
+def load_verifier_workflow_bindings(path: Path) -> dict[str, str]:
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=path.as_posix())
+    except (OSError, UnicodeError, SyntaxError) as error:
+        raise PolicyError("promoted verifier workflow digest binding cannot be parsed") from error
+    bindings: list[object] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == "TRUSTED_WORKFLOW_SHA256":
+            try:
+                bindings.append(ast.literal_eval(node.value))
+            except (ValueError, TypeError) as error:
+                raise PolicyError(
+                    "promoted verifier workflow digest binding must be a literal"
+                ) from error
+    if len(bindings) != 1:
+        raise PolicyError("promoted verifier must contain exactly one workflow digest binding")
+    return validate_workflow_digest_mapping(bindings[0])
+
+
+def validate_workflow_bytes(root: Path, bindings: dict[str, str]) -> None:
+    expected = validate_workflow_digest_mapping(bindings)
+    workflows = root / ".github" / "workflows"
+    for name, digest in expected.items():
+        path = workflows / name
+        try:
+            content = path.read_bytes()
+        except OSError as error:
+            raise PolicyError(f"trusted workflow is missing: {name}") from error
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise PolicyError(f"trusted workflow byte digest mismatch: {name}")
+
+
+def validate_workflow_semantics(root: Path) -> None:
     workflows = root / ".github" / "workflows"
     actual = {path.name for path in workflows.glob("*.yml")}
     actual.update(path.name for path in workflows.glob("*.yaml"))
@@ -980,6 +1893,11 @@ def validate_workflows(root: Path) -> None:
 
     for path in sorted(workflows.iterdir()):
         text = path.read_text(encoding="utf-8")
+        if path.name in {
+            "deploy-approved-release.yml",
+            "sign-authenticity-request.yml",
+        }:
+            validate_privileged_workflow_yaml_subset(text, path.name)
         lines = workflow_lines(text)
         lowered = text.lower()
         for forbidden in (
@@ -1024,6 +1942,17 @@ def validate_workflows(root: Path) -> None:
     for value in required_signing_controls:
         if value not in signing:
             raise PolicyError(f"signing workflow is missing required control: {value}")
+    if executable_step_inventory(signing, "sign-authenticity-request.yml") != (
+        expected_signing_executable_steps()
+    ):
+        raise PolicyError(
+            "signing workflow executable steps must match the exact finite inventory"
+        )
+    signing_blocks = active_shell_blocks(signing)
+    if signing_blocks != expected_signing_shell_blocks():
+        raise PolicyError(
+            "signing workflow shell block must match the finite command allowlist"
+        )
     for forbidden in (
         "contents: write",
         "packages: write",
@@ -1064,7 +1993,17 @@ def validate_workflows(root: Path) -> None:
     for value in required:
         if value not in deploy:
             raise PolicyError(f"deployment workflow is missing required control: {value}")
+    if executable_step_inventory(deploy, "deploy-approved-release.yml") != (
+        expected_deployment_executable_steps()
+    ):
+        raise PolicyError(
+            "deployment workflow executable steps must match the exact finite inventory"
+        )
     deploy_blocks = active_shell_blocks(deploy)
+    if deploy_blocks != expected_deployment_shell_blocks():
+        raise PolicyError(
+            "deployment workflow shell blocks must match the finite command allowlist"
+        )
     tracked_authenticity = (
         "git ls-files --error-unmatch -- \\",
         "authenticity/authenticity-request.json \\",
@@ -1132,6 +2071,14 @@ def validate_workflows(root: Path) -> None:
     secret_names = set(re.findall(r"secrets\.([A-Za-z0-9_]+)", deploy))
     if secret_names != ALLOWED_ENVIRONMENT_SECRETS:
         raise PolicyError("deployment secret allowlist does not match policy")
+
+
+def validate_workflows(
+    root: Path, bindings: dict[str, str] = TRUSTED_WORKFLOW_SHA256
+) -> None:
+    validate_workflow_bytes(root, bindings)
+    validate_workflow_semantics(root)
+
 
 def load_policy_document(root: Path) -> dict[str, object]:
     try:
@@ -1201,10 +2148,12 @@ def validate_release_documents(root: Path, policy_document: dict[str, object]) -
         raise PolicyError(f"release manifest validation failed: {error}") from error
 
 
-def validate_candidate_content(root: Path) -> dict[str, int]:
+def validate_candidate_content(
+    root: Path, workflow_bindings: dict[str, str] = TRUSTED_WORKFLOW_SHA256
+) -> dict[str, int]:
     files = repository_files(root)
     scan_sensitive_content(root, files)
-    validate_workflows(root)
+    validate_workflows(root, workflow_bindings)
     policy_document = load_policy_document(root)
     validate_authenticity_documents(root, policy_document)
     validate_release_documents(root, policy_document)
@@ -1228,7 +2177,12 @@ def validate_transition(trusted_root: Path, candidate_root: Path) -> dict[str, i
             if path.is_file() and ".git" not in path.relative_to(candidate_root).parts
         ]
         return {"files": len(files), "bytes": sum(path.stat().st_size for path in files)}
-    return validate_candidate_content(candidate_root)
+    workflow_bindings = TRUSTED_WORKFLOW_SHA256
+    if transition == "promote":
+        workflow_bindings = load_verifier_workflow_bindings(
+            candidate_root / "scripts" / "verify_repository_policy.py"
+        )
+    return validate_candidate_content(candidate_root, workflow_bindings)
 
 
 def main() -> int:

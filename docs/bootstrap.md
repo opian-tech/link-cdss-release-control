@@ -13,17 +13,21 @@
    repository to PRs.
 4. Assign the minimum required collaborators. Keep organization owner access
    narrowly held and independently reviewed.
-5. Replace `REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY` with the
-   literal identity
-   `https://github.com/<owner>/<repository>/.github/workflows/sign-authenticity-request.yml@refs/heads/main`
-   for this public repository and set `authenticity.signingConfigured` to `true`
-   while leaving `bootstrapComplete` set to `false`. Use the exact owner and
-   repository spelling emitted in the certificate; do not use patterns or wildcards.
-6. Run the signing workflow only from protected `main`. Download its artifact,
+5. Merge the current hardening PR while
+   `authenticity.signingConfigured` remains `false`,
+   `authenticity.expectedCertificateIdentity` remains exactly
+   `REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY`, and
+   `bootstrapComplete` remains `false`.
+6. In the next protected PR, atomically set `authenticity.signingConfigured` to
+   `true` and set `authenticity.expectedCertificateIdentity` exactly to
+   `https://github.com/opian-tech/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main`.
+   The configured identity may not be a pattern, wildcard, or different
+   repository identity.
+7. Run the signing workflow only from protected `main`. Download its artifact,
    verify the request and bundle locally with Cosign `v3.0.6`, and add only the
    matching `authenticity/authenticity-request.sigstore.json` through a pull
    request. The workflow does not push or deploy.
-7. Replace the empty `clinical-safety`, `security`, and `operations` usernames in
+8. Replace the empty `clinical-safety`, `security`, and `operations` usernames in
    `release-control-policy.json`. Only after the genuine bundle is committed and
    passes repository policy, set `bootstrapComplete` to `true` through a final
    reviewed pull request. A person may belong to only one release role.

