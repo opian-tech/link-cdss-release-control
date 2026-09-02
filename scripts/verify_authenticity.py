@@ -31,6 +31,10 @@ POLICY_KEYS = {
     "certificateOidcIssuer",
 }
 IDENTITY_PLACEHOLDER = "REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY"
+EXPECTED_CERTIFICATE_IDENTITY = (
+    "https://github.com/opian-tech/link-cdss-release-control/.github/workflows/"
+    "sign-authenticity-request.yml@refs/heads/main"
+)
 EXPECTED_ISSUER = "https://token.actions.githubusercontent.com"
 MAX_REQUEST_BYTES = 4 * 1024
 MAX_BUNDLE_BYTES = 256 * 1024
@@ -124,23 +128,10 @@ def validate_authenticity_policy(document: object) -> dict[str, Any]:
         if identity != IDENTITY_PLACEHOLDER:
             raise VerificationError("unconfigured authenticity policy must retain the placeholder")
         return document
-    if not isinstance(identity, str) or not identity.startswith("https://github.com/"):
-        raise VerificationError("expected certificate identity must be an exact GitHub URL")
-    pattern_characters = ("*", "?", "[", "]", "(", ")", "|", "^", "$")
-    if any(character in identity for character in pattern_characters):
-        raise VerificationError("expected certificate identity cannot use patterns or wildcards")
-    prefix = "https://github.com/"
-    suffix = "/.github/workflows/sign-authenticity-request.yml@refs/heads/main"
-    if not identity.endswith(suffix):
-        raise VerificationError("expected certificate identity must bind the main workflow")
-    repository = identity[len(prefix) : -len(suffix)]
-    repository_parts = repository.split("/")
-    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-    if (
-        len(repository_parts) != 2
-        or any(not part or not set(part) <= allowed for part in repository_parts)
-    ):
-        raise VerificationError("expected certificate identity has an invalid repository slug")
+    if identity != EXPECTED_CERTIFICATE_IDENTITY:
+        raise VerificationError(
+            "expected certificate identity must match the configured public repository workflow"
+        )
     return document
 
 
