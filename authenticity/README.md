@@ -9,15 +9,11 @@ Cosign bundle produced by `Sign release set authenticity request` for the exact
 request bytes and must verify against the exact certificate identity and OIDC
 issuer configured in `release-control-policy.json`.
 
-The current hardening PR keeps `signingConfigured` false and retains the exact
-`REPLACE_WITH_EXACT_PUBLIC_REPOSITORY_WORKFLOW_IDENTITY` placeholder. After the
-hardening is trusted on protected `main`, the next protected PR must set
-`signingConfigured` true and replace the placeholder exactly with
-`https://github.com/opian-tech/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main`.
-The verifier permits no other configured identity. Keep `bootstrapComplete`
-false while running that workflow and committing its verified bundle. Set
-bootstrap complete only afterward. Never use a regular expression, wildcard,
-different repository, or locally generated key.
+The checked-in policy is intentionally unconfigured. Keep `bootstrapComplete`
+false while replacing the placeholder with the literal public repository
+workflow identity, enabling signing, running the workflow, and committing its
+verified bundle. Set bootstrap complete only afterward. Never use a regular
+expression, wildcard, private repository, or locally generated key.
 
 Verify locally with:
 
