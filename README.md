@@ -26,17 +26,10 @@ Cosign bundle may be committed only after the exact public GitHub repository
 workflow identity is configured and a genuine keyless signature is produced by
 `Sign release set authenticity request` using GitHub Actions OIDC.
 
-The current hardening PR deliberately leaves authenticity signing unconfigured:
-`authenticity.signingConfigured` is `false` and the certificate identity is the
-literal fail-closed placeholder. After this hardening is trusted on protected
-`main`, the next protected PR must atomically set `signingConfigured` to `true`
-and bind the exact
-`https://github.com/opian-tech/link-cdss-release-control/.github/workflows/sign-authenticity-request.yml@refs/heads/main`
-identity. The verifier already rejects every other configured identity.
-Bootstrap remains incomplete until that PR, the genuine bundle, and role
-approvers are in place. See `authenticity/README.md` and `docs/bootstrap.md`; do
-not substitute a wildcard, regular expression, foreign-repository identity, or
-fabricated bundle.
+The current `release-control-policy.json` is explicitly fail closed for
+authenticity signing because the public repository slug is not yet known. See
+`authenticity/README.md` and `docs/bootstrap.md`; do not substitute a wildcard,
+regular expression, private-repository identity, or fabricated bundle.
 
 Every release manifest must repeat the request's exact
 `releaseSetManifestSha256` and `combinedIdentitySha256` values. The manifest
@@ -85,7 +78,7 @@ Follow `docs/bootstrap.md`. The checked-in policy has `bootstrapComplete` set to
 `false` and empty role lists, so all releases fail closed until accountable
 clinical-safety, security, and operations approvers are assigned.
 
-The exact scaffold, including the reviewed trusted-code digests and policy
+The exact scaffold, including the reviewed workflow hashes and trusted policy
 verifier, must be established directly as trusted `main` before pull requests
 are accepted. Pull-request validation executes only verifier and test bytes from
 the trusted base commit; the PR head is checked out separately as inert
@@ -94,38 +87,25 @@ Main-push validation likewise runs the previous `main` commit's verifier against
 the pushed commit, preventing one pushed commit from replacing both a workflow
 and the verifier that judges it.
 
-## Trusted-code bundle rotation
+## Trusted workflow hash rotation
 
-`docs/trusted-code-digests.json` binds ten exact active files: all three
-workflows, all six Python verifier/helper/test files, and the committed
-published-base Python fixture used to prove bootstrap compatibility. Rotate
-them only as one complete bundle through three separate pull requests:
+Each workflow has a bounded set of approved byte digests in
+`scripts/verify_repository_policy.py`: one digest normally and at most two
+during a transition. Rotate one workflow through three separate pull requests:
 
-The published bootstrap check labels these transitions **PR1:** Stage,
-**PR2:** Promote, and **PR3:** Cleanup. These labels are compatibility aliases;
-each transition still applies to the complete trusted-code bundle described
-below.
+1. **PR1:** leave the workflow unchanged and add its reviewed future SHA-256 to
+   the set beside the current hash. Merge through protected `main`.
+2. **PR2:** change only the workflow to the exact future bytes already allowed
+   by trusted `main`. Merge through protected `main`.
+3. **PR3:** leave the workflow unchanged and remove the old hash, restoring a
+   singleton set. Merge through protected `main`.
 
-1. **Stage:** leave every active trusted file and active digest unchanged. Add a
-   complete `staged` mapping and matching non-executable future bytes under
-   `trust/next/<active-path>`. The candidate tree is reviewable data only; no
-   workflow imports or executes it. Merge through protected `main`.
-2. **Promote:** replace every active trusted file and the complete `active`
-   mapping with the exact staged bundle already present in the base commit.
-   Retain the staged mapping and `trust/next` tree byte-for-byte. Partial,
-   mixed, or simultaneous stage-and-promote changes fail closed. Merge through
-   protected `main`.
-3. **Cleanup:** leave active bytes and digests unchanged, then remove only the
-   staged mapping and `trust/next` tree. Cleanup is accepted only when the base
-   active and staged mappings are already identical. Merge through protected
-   `main`.
-
-Run tests, repository policy, and `actionlint` for every PR. The trust tree may
-contain no symlinks, executable files, unknown paths, or extra files. Required
-branch protection must prohibit direct pushes and every administrator or
-automation bypass; the `validate-pull-request` required check must pass from
-trusted base verifier bytes before each merge. A direct-main change to trusted
-code or its digest manifest is not an authorized rotation path.
+Run tests, repository policy, and `actionlint` for every PR. Never combine PR1
+and PR2, retain more than two hashes, or leave a transition set after PR3.
+Required branch protection must prohibit direct pushes and every administrator
+or automation bypass; the `Validate public release control` required check must
+pass from trusted base verifier bytes before each merge. A direct-main change to
+the workflow and its allowlist is not an authorized rotation path.
 
 Run all local checks with:
 
@@ -134,30 +114,5 @@ python3 scripts/verify_release.py --help
 python3 scripts/test_verify_release.py
 python3 scripts/test_verify_authenticity.py
 python3 scripts/test_verify_repository_policy.py
-python3 scripts/verify_repository_policy.py --self-check .
+python3 scripts/verify_repository_policy.py .
 ```
-
-Transition validation always compares distinct immutable trees. From a trusted
-base checkout, the workflow-compatible positional form is
-`python3 scripts/verify_repository_policy.py /path/to/candidate`; automation may
-instead pass both `--trusted-root /path/to/base` and
-`--candidate-root /path/to/candidate`. Supplying the same resolved root is an
-error and `--self-check` never authorizes a transition.
-
-The v3 published snapshot fixture is self-contained. It binds the raw bootstrap
-commit object, its root tree, all 19 published file modes and Git/SHA-256 blob
-identities, and a deterministic compressed archive containing the exact 19
-files. Validation and materialization use only Python's standard library and
-the committed fixture; they do not require Git, an external repository,
-network access, or a machine-local bootstrap copy.
-
-`bootstrapRecovery` is a lineage-scoped authorization, not a globally one-time
-state. While present in the initial hardened lineage, including after staging,
-it permits recovery only to the exact known fail-closed published snapshot.
-The first promotion consumes it, and cleanup or later transitions in that
-hardened lineage cannot restore it. Exact recovery deliberately leaves the
-hardened lineage and returns to the manifest-less published trust state.
-Reapplying hardening after recovery is a new bootstrap, requires the complete
-protected two-approval process, and establishes a new lineage with a new
-`bootstrapRecovery` authorization. No repository-only control can persist a
-global consumption marker across that intentional return to the old state.
